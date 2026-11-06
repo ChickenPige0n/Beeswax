@@ -1309,6 +1309,9 @@ impl Render for Beeswax {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Hybrid CPUs: keep ONNX Runtime on the performance cores. This runs before
+    // any session is created, so its threads inherit the affinity.
+    beeswax::cpu::pin_to_performance_cores();
     // Double-clicking the executable must still find the project's models/runtime.
     let executable = std::env::current_exe()?;
     let root = executable

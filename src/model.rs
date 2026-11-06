@@ -107,13 +107,19 @@ fn cpu_threads() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|threads| *threads > 0)
         .unwrap_or_else(|| {
+            // On a hybrid CPU the process is pinned to the performance cores,
+            // so the worker pool must not outnumber them.
+            let cap = match crate::cpu::performance_cpus() {
+                0 => 6,
+                count => count.clamp(2, 6),
+            };
             std::thread::available_parallelism()
                 .map(|count| count.get())
                 .unwrap_or(4)
                 // The int8 LSTMs plateau before saturating a larger host; leaving a
                 // little more CPU headroom also keeps capture and playback responsive.
                 .saturating_sub(2)
-                .clamp(2, 6)
+                .clamp(2, cap)
         })
 }
 

@@ -29,6 +29,7 @@ const MAX_LAG: isize = 1024;
 
 fn main() -> anyhow::Result<()> {
     raise_priority();
+    beeswax::cpu::pin_to_performance_cores();
     let root = std::env::current_dir()?;
     init_runtime(&root)?;
     let models = root.join("models");

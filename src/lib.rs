@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod cpu;
 pub mod dsp;
 #[cfg(feature = "inference")]
 pub mod model;
