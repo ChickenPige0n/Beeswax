@@ -22,6 +22,11 @@ semver = "1"
 sha2 = "0.10"
 ort = { version = "=2.0.0-rc.10", optional = true, default-features = false, features = ["std", "load-dynamic"] }
 
+[[bin]]
+name = "beeswax-bench"
+path = "src/bin/bench.rs"
+required-features = ["inference"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

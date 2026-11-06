@@ -1,0 +1,403 @@
+//! Deterministic benchmark for the filtering pipeline.
+//!
+//! Workload: the saved enrollment clip (data/voice.json or data/enrollment.wav)
+//! mixed with a fixed, locally synthesized competing speaker at 0 dB SNR. The
+//! interference fixture is produced by scripts/bench-fixture.ps1 and reused
+//! byte-for-byte, so runs compare the same audio.
+//!
+//! Quality is SI-SDR of the model output against the clean enrollment clip,
+//! minus SI-SDR of the mixture (which is 0 dB by construction). Performance is
+//! the steady-state wall-clock cost per 40 ms block through the same chain the
+//! app runs: 48 kHz capture resampling, high-pass, streaming model, overlap-add
+//! and 48 kHz output resampling.
+
+use beeswax::{
+    Backend,
+    dsp::{self, CHUNK, HighPass, RATE, Resampler, rms},
+    model::Extractor,
+};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
+
+const RATE_U32: u32 = RATE as u32;
+const AUDIO_SECONDS: usize = 3;
+const FIXTURE_OFFSET_SECONDS: usize = 3;
+const CAPTURE_RATE: u32 = 48_000;
+const CAPTURE_BLOCK: usize = 480;
+const WARMUP_SECONDS: usize = 3;
+const TIMED_SECONDS: usize = 6;
+const MAX_LAG: isize = 1024;
+
+fn main() -> anyhow::Result<()> {
+    let root = std::env::current_dir()?;
+    init_runtime(&root)?;
+    let models = root.join("models");
+    let target = load_target(&root)?;
+    let interference = load_interference(&root, &target)?;
+    let mixture = mix(&target, &interference);
+
+    let started = Instant::now();
+    let mut extractor = Extractor::new(&models, &target, Backend::Cpu)?;
+    let startup_ms = started.elapsed().as_secs_f64() * 1000.;
+    let quality = measure_quality(&mut extractor, &target, &interference, &mixture)?;
+    let perf = measure_pipeline(extractor, &mixture, startup_ms)?;
+
+    println!("METRIC chunk_latency_ms={:.3}", perf.chunk_ms);
+    println!("METRIC rtf={:.4}", perf.rtf);
+    println!("METRIC startup_ms={:.1}", perf.startup_ms);
+    println!("METRIC si_sdr_improvement_db={:.3}", quality.improvement);
+    println!("METRIC si_sdr_in_db={:.3}", quality.in_sdr);
+    println!("METRIC si_sdr_out_db={:.3}", quality.out_sdr);
+    println!("METRIC target_gain_db={:.3}", quality.target_gain);
+    println!(
+        "METRIC interference_suppression_db={:.3}",
+        quality.interference_suppression
+    );
+    println!("METRIC alignment_lag={}", quality.lag);
+    Ok(())
+}
+
+fn init_runtime(root: &Path) -> anyhow::Result<()> {
+    let path = root.join("runtime").join("onnxruntime.dll");
+    anyhow::ensure!(
+        path.is_file(),
+        "{} is missing; run `python scripts/vendor.py runtime` first",
+        path.display()
+    );
+    ort::init_from(path.to_string_lossy())
+        .with_name("BeeswaxBench")
+        .with_telemetry(false)
+        .commit()?;
+    Ok(())
+}
+
+/// The app's streaming chain, minus the audio devices and ring buffers.
+struct Pipeline {
+    input: Resampler,
+    high_pass: HighPass,
+    extractor: Extractor,
+    output: Resampler,
+    pending: Vec<f32>,
+}
+
+impl Pipeline {
+    fn new(extractor: Extractor) -> Self {
+        Self {
+            input: Resampler::new(CAPTURE_RATE, RATE_U32),
+            high_pass: HighPass::new(RATE as f32, 70.),
+            extractor,
+            output: Resampler::new(RATE_U32, CAPTURE_RATE),
+            pending: Vec::with_capacity(CHUNK * 2),
+        }
+    }
+
+    /// Feed one capture-rate block. Returns how many 40 ms blocks the model ran.
+    fn push(&mut self, block: &[f32]) -> anyhow::Result<usize> {
+        let mut mono = self.input.push(block);
+        self.high_pass.process(&mut mono);
+        self.pending.extend_from_slice(&mono);
+        let mut chunks = 0;
+        while self.pending.len() >= CHUNK {
+            let filtered = self.extractor.push(&self.pending[..CHUNK])?;
+            self.pending.drain(..CHUNK);
+            let _ = self.output.push(&filtered);
+            chunks += 1;
+        }
+        Ok(chunks)
+    }
+}
+
+struct Quality {
+    improvement: f64,
+    in_sdr: f64,
+    out_sdr: f64,
+    target_gain: f64,
+    interference_suppression: f64,
+    lag: isize,
+}
+
+fn measure_quality(
+    extractor: &mut Extractor,
+    target: &[f32],
+    interference: &[f32],
+    mixture: &[f32],
+) -> anyhow::Result<Quality> {
+    let mut output = Vec::with_capacity(mixture.len());
+    for chunk in mixture.chunks(CHUNK) {
+        output.extend(extractor.push(chunk)?);
+    }
+    let lag = best_lag(&output, target, MAX_LAG);
+    let (estimate, start) = match lag {
+        lag if lag >= 0 => (&output[lag as usize..], 0),
+        lag => (&output[..], (-lag) as usize),
+    };
+    let length = estimate.len().min(target.len() - start);
+    let estimate = &estimate[..length];
+    let reference = &target[start..start + length];
+    let noise = &interference[start..start + length];
+    let mixture = &mixture[start..start + length];
+
+    let in_sdr = si_sdr(mixture, reference);
+    let out_sdr = si_sdr(estimate, reference);
+    let (target_gain, interference_gain) = projection(estimate, reference, noise);
+    Ok(Quality {
+        improvement: out_sdr - in_sdr,
+        in_sdr,
+        out_sdr,
+        target_gain: 20. * target_gain.abs().log10(),
+        interference_suppression: -20. * interference_gain.abs().max(1e-12).log10(),
+        lag,
+    })
+}
+
+struct Performance {
+    chunk_ms: f64,
+    rtf: f64,
+    startup_ms: f64,
+}
+
+fn measure_pipeline(
+    extractor: Extractor,
+    mixture: &[f32],
+    startup_ms: f64,
+) -> anyhow::Result<Performance> {
+    // A 48 kHz capture that carries exactly the timed workload: one 3 s pass for
+    // warm-up, six timed seconds. Upsampling is not part of the measurement.
+    let mut upsampler = Resampler::new(RATE_U32, CAPTURE_RATE);
+    let mut capture = Vec::with_capacity((WARMUP_SECONDS + TIMED_SECONDS) * CAPTURE_RATE as usize);
+    for _ in 0..(WARMUP_SECONDS + TIMED_SECONDS) / AUDIO_SECONDS {
+        capture.extend(upsampler.push(mixture));
+    }
+
+    let mut pipeline = Pipeline::new(extractor);
+    let warmup_blocks = WARMUP_SECONDS * CAPTURE_RATE as usize / CAPTURE_BLOCK;
+    let mut elapsed = Duration::ZERO;
+    let mut chunks = 0usize;
+    for (index, block) in capture.chunks(CAPTURE_BLOCK).enumerate() {
+        if index < warmup_blocks {
+            pipeline.push(block)?;
+            continue;
+        }
+        let started = Instant::now();
+        chunks += pipeline.push(block)?;
+        elapsed += started.elapsed();
+    }
+    anyhow::ensure!(chunks > 0, "The pipeline produced no 40 ms blocks");
+    let seconds = elapsed.as_secs_f64();
+    Ok(Performance {
+        chunk_ms: seconds * 1000. / chunks as f64,
+        rtf: seconds / TIMED_SECONDS as f64,
+        startup_ms,
+    })
+}
+
+/// Enrollment clip saved by the app: `data/voice.json` first, then the PCM16 WAV.
+fn load_target(root: &Path) -> anyhow::Result<Vec<f32>> {
+    let data = root.join("data");
+    let json = data.join("voice.json");
+    let samples = if json.is_file() {
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&json)?)?;
+        let samples: Vec<f32> = serde_json::from_value(
+            value
+                .get("samples")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{} has no samples", json.display()))?,
+        )?;
+        samples
+    } else {
+        let wav = data.join("enrollment.wav");
+        anyhow::ensure!(
+            wav.is_file(),
+            "No enrolled voice found. Record a voice in Beeswax first ({} or {}).",
+            json.display(),
+            wav.display()
+        );
+        read_wav(&wav)?
+    };
+    let sample = dsp::enrollment(&samples)?;
+    anyhow::ensure!(
+        sample.len() == AUDIO_SECONDS * RATE,
+        "Enrollment clip has {} samples, expected {}",
+        sample.len(),
+        AUDIO_SECONDS * RATE
+    );
+    Ok(sample)
+}
+
+/// A 3 s competing-talker segment scaled so the mixture is 0 dB SNR.
+fn load_interference(root: &Path, target: &[f32]) -> anyhow::Result<Vec<f32>> {
+    let path = root
+        .join("target")
+        .join("autoresearch")
+        .join("interference.wav");
+    anyhow::ensure!(
+        path.is_file(),
+        "{} is missing; run scripts/bench-fixture.ps1",
+        path.display()
+    );
+    let wav = read_wav(&path)?;
+    let start = FIXTURE_OFFSET_SECONDS * RATE;
+    anyhow::ensure!(
+        wav.len() >= start + AUDIO_SECONDS * RATE,
+        "{} is shorter than {} seconds",
+        path.display(),
+        FIXTURE_OFFSET_SECONDS + AUDIO_SECONDS
+    );
+    let mut segment = wav[start..start + AUDIO_SECONDS * RATE].to_vec();
+    let gain = rms(target) / rms(&segment);
+    for sample in &mut segment {
+        *sample *= gain;
+    }
+    Ok(segment)
+}
+
+fn mix(target: &[f32], interference: &[f32]) -> Vec<f32> {
+    target
+        .iter()
+        .zip(interference)
+        .map(|(speech, noise)| speech + noise)
+        .collect()
+}
+
+/// PCM16, mono, 16 kHz WAV reader. Ignores unknown chunks (e.g. LIST).
+fn read_wav(path: &Path) -> anyhow::Result<Vec<f32>> {
+    let bytes = std::fs::read(path)?;
+    anyhow::ensure!(
+        bytes.len() >= 44 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "{} is not a RIFF/WAVE file",
+        path.display()
+    );
+    let mut format = 0u16;
+    let mut channels = 0u16;
+    let mut rate = 0u32;
+    let mut bits = 0u16;
+    let mut data: Option<&[u8]> = None;
+    let mut position = 12;
+    while position + 8 <= bytes.len() {
+        let id = &bytes[position..position + 4];
+        let size =
+            u32::from_le_bytes(bytes[position + 4..position + 8].try_into().unwrap()) as usize;
+        let start = position + 8;
+        let end = start.saturating_add(size).min(bytes.len());
+        match id {
+            b"fmt " if end >= start + 16 => {
+                format = u16::from_le_bytes(bytes[start..start + 2].try_into().unwrap());
+                channels = u16::from_le_bytes(bytes[start + 2..start + 4].try_into().unwrap());
+                rate = u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap());
+                bits = u16::from_le_bytes(bytes[start + 14..start + 16].try_into().unwrap());
+            }
+            b"data" => data = Some(&bytes[start..end]),
+            _ => {}
+        }
+        position = end + (size & 1);
+    }
+    anyhow::ensure!(
+        format == 1 && channels == 1 && rate == RATE_U32 && bits == 16,
+        "{} must be 16 kHz mono PCM16",
+        path.display()
+    );
+    let data = data.ok_or_else(|| anyhow::anyhow!("{} has no data chunk", path.display()))?;
+    Ok(data
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.)
+        .collect())
+}
+
+/// Lag in `[-max, max]` that maximises normalised correlation with `reference`.
+fn best_lag(estimate: &[f32], reference: &[f32], max: isize) -> isize {
+    let mut best = (0, f64::NEG_INFINITY);
+    for lag in -max..=max {
+        let (estimate, start) = if lag >= 0 {
+            (&estimate[lag as usize..], 0)
+        } else {
+            (estimate, (-lag) as usize)
+        };
+        let length = estimate.len().min(reference.len().saturating_sub(start));
+        if length < RATE {
+            continue;
+        }
+        let estimate = &estimate[..length];
+        let reference = &reference[start..start + length];
+        let mut dot = 0f64;
+        let mut estimate_energy = 0f64;
+        let mut reference_energy = 0f64;
+        for (&a, &b) in estimate.iter().zip(reference) {
+            dot += a as f64 * b as f64;
+            estimate_energy += (a as f64).powi(2);
+            reference_energy += (b as f64).powi(2);
+        }
+        let denominator = (estimate_energy * reference_energy).sqrt();
+        let score = if denominator > 0. {
+            dot / denominator
+        } else {
+            f64::NEG_INFINITY
+        };
+        if score > best.1 {
+            best = (lag, score);
+        }
+    }
+    best.0
+}
+
+fn si_sdr(estimate: &[f32], reference: &[f32]) -> f64 {
+    let (mut estimate, mut reference) = (estimate.to_vec(), reference.to_vec());
+    remove_mean(&mut estimate);
+    remove_mean(&mut reference);
+    let reference_energy: f64 = reference.iter().map(|x| (*x as f64).powi(2)).sum();
+    let dot: f64 = estimate
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| *a as f64 * *b as f64)
+        .sum();
+    let alpha = if reference_energy > 0. {
+        dot / reference_energy
+    } else {
+        0.
+    };
+    let signal: f64 = reference.iter().map(|x| (alpha * *x as f64).powi(2)).sum();
+    let error: f64 = estimate
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (*a as f64 - alpha * *b as f64).powi(2))
+        .sum();
+    10. * (signal / error.max(1e-18)).log10()
+}
+
+fn remove_mean(samples: &mut [f32]) {
+    let mean = samples.iter().map(|x| *x as f64).sum::<f64>() / samples.len() as f64;
+    for sample in samples {
+        *sample -= mean as f32;
+    }
+}
+
+/// Least-squares gains for [reference, interference]; returns (target, interference).
+fn projection(estimate: &[f32], reference: &[f32], interference: &[f32]) -> (f64, f64) {
+    let (mut estimate, mut reference, mut interference) =
+        (estimate.to_vec(), reference.to_vec(), interference.to_vec());
+    remove_mean(&mut estimate);
+    remove_mean(&mut reference);
+    remove_mean(&mut interference);
+    let mut rr = 0.;
+    let mut ri = 0.;
+    let mut ii = 0.;
+    let mut er = 0.;
+    let mut ei = 0.;
+    for ((&e, &r), &i) in estimate.iter().zip(&reference).zip(&interference) {
+        let (e, r, i) = (e as f64, r as f64, i as f64);
+        rr += r * r;
+        ri += r * i;
+        ii += i * i;
+        er += e * r;
+        ei += e * i;
+    }
+    let determinant = rr * ii - ri * ri;
+    if determinant.abs() < 1e-12 {
+        return (0., 0.);
+    }
+    (
+        (er * ii - ei * ri) / determinant,
+        (ei * rr - er * ri) / determinant,
+    )
+}
