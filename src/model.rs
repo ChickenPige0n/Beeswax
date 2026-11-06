@@ -151,7 +151,9 @@ fn apply_backend(
 }
 
 fn open_session(path: &Path, backend: Backend, intra_threads: usize) -> Result<Session> {
-    let builder = Session::builder()?.with_intra_threads(intra_threads)?;
+    let builder = Session::builder()?
+        .with_intra_threads(intra_threads)?
+        .with_inter_threads(1)?;
     let builder = apply_backend(builder, backend)?;
     builder
         .with_optimization_level(GraphOptimizationLevel::Level3)?
