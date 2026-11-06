@@ -70,9 +70,10 @@ impl OverlapAdd {
         }
     }
     pub fn push(&mut self, frames: &[f32]) -> Vec<f32> {
-        assert_eq!(frames.len() % FFT, 0);
-        let mut result = Vec::with_capacity(frames.len() / FFT * HOP);
-        for frame in frames.chunks_exact(FFT) {
+        let (frames, remainder) = frames.as_chunks::<FFT>();
+        assert!(remainder.is_empty());
+        let mut result = Vec::with_capacity(frames.len() * HOP);
+        for frame in frames {
             for (i, &sample) in frame.iter().enumerate() {
                 self.sum[i] += sample;
                 self.weight[i] += self.window[i];

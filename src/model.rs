@@ -253,7 +253,7 @@ impl Extractor {
         };
         ensure!(
             session.inputs.iter().any(|i| i.name == "context"),
-            "Expected the downloaded VoxLock 1.1 model interface (context input)."
+            "Expected the VoxLock 1.1 ONNX interface used by the 1.1.1 reference (context input)."
         );
         let input = Tensor::from_array(([1usize, sample.len()], sample.to_vec()))?;
         let outputs = enroll.run(ort::inputs!["enroll" => input])?;

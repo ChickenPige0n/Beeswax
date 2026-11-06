@@ -42,9 +42,9 @@ jobs:
       - name: Package Windows app
         shell: pwsh
         run: >-
-          Compress-Archive -Force -Path target/release/beeswax.exe, Start-Beeswax.ps1,
+          Compress-Archive -Force -Path target/release/beeswax.exe, LICENSE,
           scripts/setup-runtime.ps1, scripts/setup-cuda-runtime.ps1,
-          scripts/fetch-model.ps1, NOTICE, README.md -DestinationPath target/beeswax-windows-x64.zip
+          scripts/fetch-model.ps1, README.md -DestinationPath target/beeswax-windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: beeswax-windows-x64

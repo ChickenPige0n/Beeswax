@@ -1,8 +1,8 @@
 # Beeswax
 
-A Windows target-speaker virtual microphone built with **gpui-fast**, Rust **ort**, the **VoxLock 1.1** ONNX models, and **VB-CABLE**. A light native interface records enrollment, selects audio endpoints, and starts/stops voice filtering. Missing required models download from the public VoxLock Hugging Face repository on first launch.
+A Windows target-speaker virtual microphone built with **gpui-fast**, Rust **ort**, the **VoxLock 1.1.1** streaming implementation and its pinned ONNX model revision, and **VB-CABLE**. A light native interface records enrollment, selects audio endpoints, and starts/stops voice filtering. Missing required models download from the public VoxLock Hugging Face repository on first launch.
 
-Launch the optimized app with `./Start-Beeswax.ps1`, or double-click `target/release/beeswax.exe` after building.
+After building, launch `target/release/beeswax.exe`.
 
 ## Build and run
 
@@ -99,7 +99,7 @@ If the meter does not respond, click **Test microphone** and read the status mes
 
 Physical microphone → WASAPI/CPAL → mono → streaming sinc resampler → 16 kHz / 40 ms blocks → VoxLock via ort → weighted overlap-add → cable-rate resampling → VB-CABLE playback endpoint.
 
-The downloaded graphs use `enroll_mag` and `context`, with recurrent `h/c` state `[6,32,256]`. This is the **1.1 interface**, not the incompatible v2 graphs used by recent VoxLock packages. The implementation preserves recurrent state, reflects the initial 256 samples, uses 512-sample frames with a 128-sample hop, and applies squared-Hann overlap normalization and the upstream -0.5 output scale.
+The downloaded graphs use `enroll_mag` and `context`, with recurrent `h/c` state `[6,32,256]`. VoxLock 1.1.1's reference implementation pins the ONNX files to Hugging Face revision `a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03`; those weights expose the **1.1 ONNX interface**, not the incompatible v2 graphs. The 1.1.1 release changes automatic `live()` enrollment, while Beeswax uses explicit enrollment. The implementation preserves recurrent state, reflects the initial 256 samples, uses 512-sample frames with a 128-sample hop, and applies squared-Hann overlap normalization and the upstream -0.5 output scale.
 
 Audio callbacks use bounded lock-free rings; model work runs on a worker thread. Missing samples produce silence. Capture and playback overload drop samples, trim stale capture when the model falls behind so latency stays bounded, and report the gap while keeping the session alive; repeated ONNX/device errors stop the stream, with no raw-audio bypass. Device IDs are used for opening endpoints rather than unstable enumeration positions. A stopped stream can be refreshed and restarted after device reconnection.
 
@@ -151,11 +151,11 @@ This explicitly disables inference. Enrollment and device controls remain availa
 
 Hardware acceptance: enroll a real voice, record CABLE Output in a separate app while the enrolled person and a second speaker alternate and overlap, check retained-voice quality and background suppression, then exercise Stop, unplug/reconnect, re-enrollment, and a sustained call. This must be done on actual microphones and VB-CABLE; synthetic tests cannot establish it.
 
-## Sources
+## Sources and licensing
+
+Beeswax source code is licensed under MIT; see `LICENSE`. VoxLock's reference implementation and downloaded ONNX model files remain Apache-2.0 and are not relicensed by Beeswax. The model files are downloaded from the pinned upstream revision above. GPUI Fast and other dependencies retain their own licenses; VB-CABLE is a separate VB-Audio product.
 
 - [gpui-fast](https://github.com/longbridge/gpui-fast) — native UI, Apache-2.0.
 - [ort](https://github.com/pykeio/ort) — Rust ONNX Runtime binding.
-- [VoxLock 1.1.1 streaming reference](https://github.com/arbazsiddiqui/voxlock/blob/v1.1.1/voxlock/core.py) and [model repository](https://huggingface.co/arbazsiddiqui/voxlock).
+- [VoxLock 1.1.1 streaming reference](https://github.com/arbazsiddiqui/voxlock/blob/v1.1.1/voxlock/core.py) and [Apache-2.0 model repository](https://huggingface.co/arbazsiddiqui/voxlock).
 - [VB-CABLE routing](https://vb-audio.com/Cable/) — separately installed virtual driver.
-
-See `NOTICE` for attribution. Preserve upstream model and runtime licenses when redistributing them.

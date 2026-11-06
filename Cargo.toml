@@ -3,6 +3,7 @@ name = "beeswax"
 version = "0.1.0"
 edition = "2024"
 description = "Local target-speaker virtual microphone for Windows"
+license = "MIT"
 
 [features]
 default = ["cuda"]

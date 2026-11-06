@@ -11,15 +11,17 @@ use std::{
 };
 
 const MINIMUM_MODEL_BYTES: u64 = 1_000_000;
+const VOXLOCK_MODEL_REVISION: &str = "a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03";
+const VOXLOCK_MODEL_URL: &str = "https://huggingface.co/arbazsiddiqui/voxlock/resolve";
 const REQUIRED_MODELS: [(&str, &str, &str); 2] = [
     (
         "enroll.onnx",
-        "https://huggingface.co/arbazsiddiqui/voxlock/resolve/main/onnx/enroll.onnx",
+        "onnx/enroll.onnx",
         "86645cba23f207def0b31a6e74a615d3b7a813b4fdf957c53b3af2905ba2ffd3",
     ),
     (
         "chunk_int8.onnx",
-        "https://huggingface.co/arbazsiddiqui/voxlock/resolve/main/onnx/chunk_int8.onnx",
+        "onnx/chunk_int8.onnx",
         "f0d2b0aaf95affe8894ea008d0105be4f5f5354f7244835534c31b1a7dd4699a",
     ),
 ];
@@ -89,7 +91,7 @@ pub fn start(folder: PathBuf, state: Arc<Mutex<State>>) {
 
 fn download_required(folder: &Path, mut progress: impl FnMut(usize, &str, u64)) -> Result<()> {
     std::fs::create_dir_all(folder).context("Could not create the models directory")?;
-    for (index, (name, url, checksum)) in REQUIRED_MODELS.iter().enumerate() {
+    for (index, (name, file, checksum)) in REQUIRED_MODELS.iter().enumerate() {
         let destination = folder.join(name);
         if destination
             .metadata()
@@ -98,7 +100,8 @@ fn download_required(folder: &Path, mut progress: impl FnMut(usize, &str, u64)) 
             continue;
         }
         progress(index + 1, name, 0);
-        download_file(url, &destination, checksum, |bytes| {
+        let url = format!("{VOXLOCK_MODEL_URL}/{VOXLOCK_MODEL_REVISION}/{file}");
+        download_file(&url, &destination, checksum, |bytes| {
             progress(index + 1, name, bytes)
         })?;
     }
