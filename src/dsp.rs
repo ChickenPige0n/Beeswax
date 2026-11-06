@@ -186,6 +186,45 @@ pub fn rms(x: &[f32]) -> f32 {
     (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
 }
 
+/// 40 ms blocks of silence the model still sees before inference is skipped. The
+/// hangover lets the recurrent state and overlap-add history settle into silence,
+/// so speech after a pause joins a stream that is already quiet, not a hard cut.
+pub const GATE_HANGOVER_CHUNKS: usize = 5;
+/// RMS below this is treated as true silence (-60 dBFS). Quiet room tone and
+/// speech stay above it; digital silence and muted microphones fall below.
+pub const GATE_SILENCE_RMS: f32 = 0.001;
+
+/// Decides when a 40 ms block can bypass the separation model. Disabled paths
+/// return `false` for every block, which keeps the benchmark comparisons honest.
+pub struct Gate {
+    silent: usize,
+    enabled: bool,
+}
+
+impl Gate {
+    pub fn new(enabled: bool) -> Self {
+        Self { silent: 0, enabled }
+    }
+
+    /// True when this block should be emitted as silence without running the model.
+    pub fn skip(&mut self, samples: &[f32]) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if rms(samples) > GATE_SILENCE_RMS {
+            self.silent = 0;
+            false
+        } else {
+            self.silent = self.silent.saturating_add(1);
+            self.silent > GATE_HANGOVER_CHUNKS
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.silent = 0;
+    }
+}
+
 pub fn enrollment(x: &[f32]) -> anyhow::Result<Vec<f32>> {
     anyhow::ensure!(
         x.len() >= 3 * RATE,
@@ -326,5 +365,28 @@ mod tests {
         let mut x = vec![0.; 48000];
         x.extend(vec![0.1; 48000]);
         assert_eq!(enrollment(&x).unwrap(), vec![0.1; 48000]);
+    }
+
+    #[test]
+    fn silence_gate_waits_for_hangover_and_resets_on_speech() {
+        let loud = vec![0.05; CHUNK];
+        let silent = vec![0.; CHUNK];
+        let mut gate = Gate::new(true);
+        assert!(!gate.skip(&loud));
+        for _ in 0..GATE_HANGOVER_CHUNKS {
+            assert!(!gate.skip(&silent), "the hangover still runs the model");
+        }
+        assert!(
+            gate.skip(&silent),
+            "after the hangover the block is skipped"
+        );
+        assert!(!gate.skip(&loud), "speech immediately re-enables the model");
+        for _ in 0..GATE_HANGOVER_CHUNKS {
+            assert!(!gate.skip(&silent));
+        }
+        let mut disabled = Gate::new(false);
+        for _ in 0..20 {
+            assert!(!disabled.skip(&silent));
+        }
     }
 }

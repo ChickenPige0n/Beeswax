@@ -117,6 +117,12 @@ fn configured_backend() -> Backend {
     }
 }
 
+/// The app always runs the gate; `BENCH_GATE=0` reproduces the old ungated
+/// workload for A/B diagnostics.
+fn gate_enabled() -> bool {
+    std::env::var("BENCH_GATE").ok().as_deref() != Some("0")
+}
+
 /// Benchmark the pipeline's capability rather than the background load: the
 /// measurement process runs high-priority, while the app itself stays normal.
 fn raise_priority() {
@@ -196,6 +202,7 @@ struct Pipeline {
     extractor: Extractor,
     output: Resampler,
     pending: Vec<f32>,
+    gate: dsp::Gate,
     collect: bool,
     collected: Vec<f32>,
 }
@@ -208,6 +215,7 @@ impl Pipeline {
             extractor,
             output: Resampler::new(RATE_U32, CAPTURE_RATE),
             pending: Vec::with_capacity(CHUNK * 2),
+            gate: dsp::Gate::new(gate_enabled()),
             collect,
             collected: Vec::new(),
         }
@@ -222,9 +230,14 @@ impl Pipeline {
         let mut chunks = 0;
         let mut model_ms = 0.;
         while self.pending.len() >= CHUNK {
-            let started = Instant::now();
-            let filtered = self.extractor.push(&self.pending[..CHUNK])?;
-            model_ms += started.elapsed().as_secs_f64() * 1000.;
+            let filtered = if self.gate.skip(&self.pending[..CHUNK]) {
+                vec![0.; CHUNK]
+            } else {
+                let started = Instant::now();
+                let filtered = self.extractor.push(&self.pending[..CHUNK])?;
+                model_ms += started.elapsed().as_secs_f64() * 1000.;
+                filtered
+            };
             if self.collect {
                 self.collected.extend_from_slice(&filtered);
             }
