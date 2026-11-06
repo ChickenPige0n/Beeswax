@@ -180,6 +180,7 @@ impl Job {
     pub fn finished(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         input: String,
         output: Option<String>,
@@ -418,10 +419,10 @@ fn run(
         None => None,
     };
     let result = run_stream(input, output, recording, &mut model, stop, state, monitor);
-    if result.is_ok() {
-        if let (Some(sample), Some(extractor)) = (sample.as_ref(), model.take()) {
-            cache.release(&model_dir, sample, backend, extractor);
-        }
+    if result.is_ok()
+        && let (Some(sample), Some(extractor)) = (sample.as_ref(), model.take())
+    {
+        cache.release(&model_dir, sample, backend, extractor);
     }
     result
 }
