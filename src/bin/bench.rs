@@ -230,13 +230,17 @@ impl Pipeline {
         let mut chunks = 0;
         let mut model_ms = 0.;
         while self.pending.len() >= CHUNK {
-            let filtered = if self.gate.skip(&self.pending[..CHUNK]) {
-                vec![0.; CHUNK]
-            } else {
-                let started = Instant::now();
-                let filtered = self.extractor.push(&self.pending[..CHUNK])?;
-                model_ms += started.elapsed().as_secs_f64() * 1000.;
-                filtered
+            let filtered = match self.gate.next(&self.pending[..CHUNK]) {
+                dsp::GateAction::Skip => vec![0.; CHUNK],
+                action => {
+                    if action == dsp::GateAction::ResumeState {
+                        self.extractor.reset_state()?;
+                    }
+                    let started = Instant::now();
+                    let filtered = self.extractor.push(&self.pending[..CHUNK])?;
+                    model_ms += started.elapsed().as_secs_f64() * 1000.;
+                    filtered
+                }
             };
             if self.collect {
                 self.collected.extend_from_slice(&filtered);

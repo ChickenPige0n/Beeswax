@@ -190,12 +190,26 @@ pub fn rms(x: &[f32]) -> f32 {
 /// hangover lets the recurrent state and overlap-add history settle into silence,
 /// so speech after a pause joins a stream that is already quiet, not a hard cut.
 pub const GATE_HANGOVER_CHUNKS: usize = 5;
+/// Silence longer than this (1 s) makes the carried recurrent state stale; the
+/// first speech block clears only `h/c`, leaving the output cadence untouched.
+pub const GATE_RESET_CHUNKS: usize = 25;
 /// RMS below this is treated as true silence (-60 dBFS). Quiet room tone and
 /// speech stay above it; digital silence and muted microphones fall below.
 pub const GATE_SILENCE_RMS: f32 = 0.001;
 
+/// What a filtering loop should do with one 40 ms block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateAction {
+    /// Run the model normally.
+    Run,
+    /// Emit silence without running the model.
+    Skip,
+    /// Clear the model's recurrent state, then run the model on this block.
+    ResumeState,
+}
+
 /// Decides when a 40 ms block can bypass the separation model. Disabled paths
-/// return `false` for every block, which keeps the benchmark comparisons honest.
+/// always return `Run`, which keeps the benchmark A/B honest.
 pub struct Gate {
     silent: usize,
     enabled: bool,
@@ -206,22 +220,26 @@ impl Gate {
         Self { silent: 0, enabled }
     }
 
-    /// True when this block should be emitted as silence without running the model.
-    pub fn skip(&mut self, samples: &[f32]) -> bool {
+    pub fn next(&mut self, samples: &[f32]) -> GateAction {
         if !self.enabled {
-            return false;
+            return GateAction::Run;
         }
         if rms(samples) > GATE_SILENCE_RMS {
+            let long_pause = self.silent > GATE_RESET_CHUNKS;
             self.silent = 0;
-            false
+            if long_pause {
+                GateAction::ResumeState
+            } else {
+                GateAction::Run
+            }
         } else {
             self.silent = self.silent.saturating_add(1);
-            self.silent > GATE_HANGOVER_CHUNKS
+            if self.silent > GATE_HANGOVER_CHUNKS {
+                GateAction::Skip
+            } else {
+                GateAction::Run
+            }
         }
-    }
-
-    pub fn reset(&mut self) {
-        self.silent = 0;
     }
 }
 
@@ -372,21 +390,37 @@ mod tests {
         let loud = vec![0.05; CHUNK];
         let silent = vec![0.; CHUNK];
         let mut gate = Gate::new(true);
-        assert!(!gate.skip(&loud));
+        assert_eq!(gate.next(&loud), GateAction::Run);
         for _ in 0..GATE_HANGOVER_CHUNKS {
-            assert!(!gate.skip(&silent), "the hangover still runs the model");
+            assert_eq!(gate.next(&silent), GateAction::Run, "the hangover runs");
         }
-        assert!(
-            gate.skip(&silent),
+        assert_eq!(
+            gate.next(&silent),
+            GateAction::Skip,
             "after the hangover the block is skipped"
         );
-        assert!(!gate.skip(&loud), "speech immediately re-enables the model");
+        assert_eq!(
+            gate.next(&loud),
+            GateAction::Run,
+            "speech immediately re-enables the model"
+        );
         for _ in 0..GATE_HANGOVER_CHUNKS {
-            assert!(!gate.skip(&silent));
+            assert_eq!(gate.next(&silent), GateAction::Run);
         }
+
+        let mut long = Gate::new(true);
+        for _ in 0..=GATE_RESET_CHUNKS {
+            let _ = long.next(&silent);
+        }
+        assert_eq!(
+            long.next(&loud),
+            GateAction::ResumeState,
+            "a long pause clears only the recurrent state on speech"
+        );
+
         let mut disabled = Gate::new(false);
         for _ in 0..20 {
-            assert!(!disabled.skip(&silent));
+            assert_eq!(disabled.next(&silent), GateAction::Run);
         }
     }
 }

@@ -615,28 +615,37 @@ fn run_stream(
                     return Ok(());
                 }
                 let start = Instant::now();
-                let filtered = if gate.skip(&pending[..CHUNK]) {
+                let filtered = match gate.next(&pending[..CHUNK]) {
                     // The hangover already fed silence to the model; skipping keeps the
                     // stream in time while emitting exact silence through the resampler.
-                    vec![0.; CHUNK]
-                } else {
-                    match model.as_mut().unwrap().push(&pending[..CHUNK]) {
-                        Ok(filtered) => {
-                            failures = 0;
-                            filtered
+                    dsp::GateAction::Skip => vec![0.; CHUNK],
+                    action => {
+                        let extractor = model.as_mut().unwrap();
+                        if action == dsp::GateAction::ResumeState
+                            && let Err(error) = extractor.reset_state()
+                        {
+                            state.lock().unwrap().message = format!(
+                                "Could not clear the stale voice state; continuing: {error:#}"
+                            );
                         }
-                        // A single bad block should not end the call: drop it, keep the stream
-                        // alive, and only stop when the model keeps failing.
-                        Err(error) => {
-                            failures += 1;
-                            if failures >= 3 {
-                                return Err(
-                                    error.context("The voice model stopped returning audio")
-                                );
+                        match extractor.push(&pending[..CHUNK]) {
+                            Ok(filtered) => {
+                                failures = 0;
+                                filtered
                             }
-                            state.lock().unwrap().message =
-                                format!("Voice model hiccup; recovering: {error:#}");
-                            vec![0.; CHUNK]
+                            // A single bad block should not end the call: drop it, keep the stream
+                            // alive, and only stop when the model keeps failing.
+                            Err(error) => {
+                                failures += 1;
+                                if failures >= 3 {
+                                    return Err(
+                                        error.context("The voice model stopped returning audio")
+                                    );
+                                }
+                                state.lock().unwrap().message =
+                                    format!("Voice model hiccup; recovering: {error:#}");
+                                vec![0.; CHUNK]
+                            }
                         }
                     }
                 };

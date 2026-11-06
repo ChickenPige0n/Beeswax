@@ -18,6 +18,9 @@ impl Extractor {
             "Inference is not included in this development build. Build with default features."
         )
     }
+    pub fn reset_state(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     pub fn reset(&mut self) -> anyhow::Result<()> {
         Ok(())
     }

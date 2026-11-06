@@ -296,11 +296,19 @@ impl Extractor {
         })
     }
 
+    /// Clear only the recurrent state. A long silence makes the carried `h/c`
+    /// stale, but the pending samples and overlap-add history must keep their
+    /// place so the 40 ms output cadence does not move.
+    pub fn reset_state(&mut self) -> Result<()> {
+        self.h = Tensor::from_array(([6usize, 32, 256], vec![0f32; 6 * 32 * 256]))?;
+        self.c = Tensor::from_array(([6usize, 32, 256], vec![0f32; 6 * 32 * 256]))?;
+        Ok(())
+    }
+
     /// Clear the streaming state so a cached extractor can start a new filtering
     /// session. The sessions and the enrollment embedding are reused.
     pub fn reset(&mut self) -> Result<()> {
-        self.h = Tensor::from_array(([6usize, 32, 256], vec![0f32; 6 * 32 * 256]))?;
-        self.c = Tensor::from_array(([6usize, 32, 256], vec![0f32; 6 * 32 * 256]))?;
+        self.reset_state()?;
         self.pending.clear();
         self.started = false;
         self.skip = 256;
