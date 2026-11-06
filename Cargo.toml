@@ -1,0 +1,26 @@
+[package]
+name = "beeswax"
+version = "0.1.0"
+edition = "2024"
+description = "Local target-speaker virtual microphone for Windows"
+
+[features]
+default = ["cuda"]
+inference = ["dep:ort"]
+cuda = ["inference", "ort/cuda"]
+
+[dependencies]
+anyhow = "1"
+gpui = { package = "gpui-fast", version = "=0.1.2", default-features = false, features = ["font-kit", "windows-manifest"] }
+gpui_platform = { package = "gpui-fast-platform", version = "=0.1.2", default-features = false }
+cpal = "=0.17.3"
+ringbuf = "0.4.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+ort = { version = "=2.0.0-rc.10", optional = true, default-features = false, features = ["std", "load-dynamic"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
