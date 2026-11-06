@@ -18,6 +18,9 @@ impl Extractor {
             "Inference is not included in this development build. Build with default features."
         )
     }
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     pub fn engine(&self) -> crate::Backend {
         crate::Backend::Cpu
     }

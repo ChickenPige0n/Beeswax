@@ -54,6 +54,7 @@ struct Beeswax {
     select_focus: [gpui::FocusHandle; 3],
     status: Arc<Mutex<Status>>,
     job: Option<Job>,
+    cache: Arc<audio::ModelCache>,
     voice: Option<Vec<f32>>,
     model_dir: PathBuf,
     data_dir: PathBuf,
@@ -125,6 +126,7 @@ impl Beeswax {
                 ..Default::default()
             })),
             job: None,
+            cache: Arc::new(audio::ModelCache::new()),
             voice: voice.ok(),
             model_dir,
             data_dir,
@@ -275,6 +277,7 @@ impl Beeswax {
             self.status.clone(),
             monitor,
             self.backend,
+            self.cache.clone(),
         ));
         self.open_select = None;
     }
@@ -941,6 +944,7 @@ impl Render for Beeswax {
                                                                     ) {
                                                                         Ok(()) => {
                                                                             this.voice = None;
+                                                                            this.cache.clear();
                                                                             this.status
                                                                                 .lock()
                                                                                 .unwrap()
@@ -1350,6 +1354,7 @@ fn main() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("No default microphone"))?;
         println!("Testing {} for three seconds (not saved)", device.name);
         let status = Arc::new(Mutex::new(Status::default()));
+        let cache = Arc::new(audio::ModelCache::new());
         let job = Job::start(
             device.id.clone(),
             None,
@@ -1358,6 +1363,7 @@ fn main() -> anyhow::Result<()> {
             status.clone(),
             true,
             Backend::Cpu,
+            cache,
         );
         for _ in 0..6 {
             std::thread::sleep(Duration::from_millis(500));

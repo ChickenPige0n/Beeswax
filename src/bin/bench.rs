@@ -13,6 +13,7 @@
 
 use beeswax::{
     Backend,
+    audio::ModelCache,
     dsp::{self, CHUNK, HighPass, RATE, Resampler, rms},
     model::Extractor,
 };
@@ -42,18 +43,19 @@ fn main() -> anyhow::Result<()> {
         return compare_threads(&models, &target, &mixture, &specification);
     }
 
+    let cache = ModelCache::new();
     let started = Instant::now();
-    let mut extractor = Extractor::new(&models, &target, Backend::Cpu)?;
+    let cold = cache.acquire(&models, &target, Backend::Cpu)?;
     let startup_ms = started.elapsed().as_secs_f64() * 1000.;
+    // Filtering stopped, the app released the sessions, and the user pressed
+    // Start again. This is the path the cache makes cheap.
+    cache.release(&models, &target, Backend::Cpu, cold);
+    let restart = Instant::now();
+    let mut extractor = cache.acquire(&models, &target, Backend::Cpu)?;
+    let warm_start_ms = restart.elapsed().as_secs_f64() * 1000.;
+
     let quality = measure_quality(&mut extractor, &target, &interference, &mixture)?;
     let perf = measure_pipeline(extractor, &mixture, startup_ms)?;
-
-    // Second start in the same process: filtering stopped and the user pressed
-    // Start again. Without a session cache this reloads both models.
-    let restart = Instant::now();
-    let reloaded = Extractor::new(&models, &target, Backend::Cpu)?;
-    let warm_start_ms = restart.elapsed().as_secs_f64() * 1000.;
-    drop(reloaded);
 
     println!("METRIC chunk_latency_ms={:.3}", perf.chunk_ms);
     println!("METRIC chunk_latency_median_ms={:.3}", perf.chunk_median_ms);

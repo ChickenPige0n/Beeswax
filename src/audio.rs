@@ -9,7 +9,7 @@ use cpal::{
 };
 use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -84,6 +84,91 @@ pub struct Status {
     pub note: String,
     pub enrollment: Option<Vec<f32>>,
 }
+/// Keeps the loaded ONNX sessions between filtering jobs. A restart only has to
+/// clear the streaming state instead of parsing the model files again.
+pub struct ModelCache {
+    slot: Mutex<Option<CachedModel>>,
+}
+
+struct CachedModel {
+    folder: PathBuf,
+    sample: Vec<f32>,
+    backend: crate::Backend,
+    extractor: Extractor,
+}
+
+impl Default for ModelCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModelCache {
+    pub fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+
+    /// Take a ready extractor for this enrollment, or load one on a miss.
+    pub fn acquire(
+        &self,
+        folder: &Path,
+        sample: &[f32],
+        backend: crate::Backend,
+    ) -> Result<Extractor> {
+        let cached = {
+            let mut slot = self.slot.lock().unwrap();
+            let matches = slot.as_ref().is_some_and(|cached| {
+                cached.folder.as_path() == folder
+                    && cached.backend == backend
+                    && cached.sample.as_slice() == sample
+            });
+            if matches {
+                slot.take()
+            } else {
+                // A different enrollment, backend, or model folder makes the
+                // cached sessions useless; drop them now rather than keep the
+                // memory until the next release.
+                *slot = None;
+                None
+            }
+        };
+        match cached {
+            Some(mut cached) => {
+                cached.extractor.reset()?;
+                Ok(cached.extractor)
+            }
+            None => Extractor::new(folder, sample, backend),
+        }
+    }
+
+    /// Put a healthy CPU extractor back for the next start. A CUDA session owns
+    /// GPU memory while idle, so it is released instead of cached.
+    pub fn release(
+        &self,
+        folder: &Path,
+        sample: &[f32],
+        backend: crate::Backend,
+        extractor: Extractor,
+    ) {
+        if extractor.engine() != crate::Backend::Cpu {
+            return;
+        }
+        *self.slot.lock().unwrap() = Some(CachedModel {
+            folder: folder.to_path_buf(),
+            sample: sample.to_vec(),
+            backend,
+            extractor,
+        });
+    }
+
+    /// Drop the cached sessions (voice forgotten, backend changed).
+    pub fn clear(&self) {
+        *self.slot.lock().unwrap() = None;
+    }
+}
+
 pub struct Job {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -103,6 +188,7 @@ impl Job {
         state: Arc<Mutex<Status>>,
         monitor: bool,
         backend: crate::Backend,
+        cache: Arc<ModelCache>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
@@ -110,7 +196,7 @@ impl Job {
             let recording = sample.is_none();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run(
-                    input, output, model_dir, sample, &flag, &state, monitor, backend,
+                    input, output, model_dir, sample, &flag, &state, monitor, backend, &cache,
                 )
             }))
             .unwrap_or_else(|_| {
@@ -324,17 +410,36 @@ fn run(
     state: &Arc<Mutex<Status>>,
     monitor: bool,
     backend: crate::Backend,
+    cache: &ModelCache,
+) -> Result<()> {
+    let recording = sample.is_none();
+    let mut model = match sample.as_ref() {
+        Some(sample) => Some(cache.acquire(&model_dir, sample, backend)?),
+        None => None,
+    };
+    let result = run_stream(input, output, recording, &mut model, stop, state, monitor);
+    if result.is_ok() {
+        if let (Some(sample), Some(extractor)) = (sample.as_ref(), model.take()) {
+            cache.release(&model_dir, sample, backend, extractor);
+        }
+    }
+    result
+}
+
+fn run_stream(
+    input: String,
+    output: Option<String>,
+    recording: bool,
+    model: &mut Option<Extractor>,
+    stop: &Arc<AtomicBool>,
+    state: &Arc<Mutex<Status>>,
+    monitor: bool,
 ) -> Result<()> {
     let host = cpal::default_host();
     let device = host
         .device_by_id(&input.parse()?)
         .context("Microphone disconnected. Refresh devices.")?;
-    let recording = sample.is_none();
-    let mut model = sample
-        .as_ref()
-        .map(|s| Extractor::new(&model_dir, s, backend))
-        .transpose()?;
-    if let Some(model) = &model {
+    if let Some(model) = model.as_ref() {
         let mut status = state.lock().unwrap();
         status.engine = model.engine().label().to_owned();
         status.model = model.model_label().to_owned();
