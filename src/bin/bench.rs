@@ -733,8 +733,10 @@ fn read_wav(path: &Path) -> anyhow::Result<Vec<f32>> {
     );
     let data = data.ok_or_else(|| anyhow::anyhow!("{} has no data chunk", path.display()))?;
     Ok(data
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| i16::from_le_bytes(*pair) as f32 / 32768.)
         .collect())
 }
 
