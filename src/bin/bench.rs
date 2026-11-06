@@ -25,6 +25,7 @@ const CAPTURE_RATE: u32 = 48_000;
 const CAPTURE_BLOCK: usize = 480;
 const WARMUP_PASSES: usize = 1;
 const TIMED_PASSES: usize = 6;
+const COMPARE_PASSES: usize = 4;
 const MAX_LAG: isize = 1024;
 
 fn main() -> anyhow::Result<()> {
@@ -36,6 +37,10 @@ fn main() -> anyhow::Result<()> {
     let target = load_target(&root)?;
     let interference = load_interference(&root, &target)?;
     let mixture = mix(&target, &interference);
+
+    if let Ok(specification) = std::env::var("BENCH_COMPARE") {
+        return compare_threads(&models, &target, &mixture, &specification);
+    }
 
     let started = Instant::now();
     let mut extractor = Extractor::new(&models, &target, Backend::Cpu)?;
@@ -253,11 +258,7 @@ fn measure_pipeline(
     // scheduling only ever adds time, so the minimum is the most stable estimate
     // of what the pipeline can do on this machine.
     let passes = WARMUP_PASSES + TIMED_PASSES;
-    let mut upsampler = Resampler::new(RATE_U32, CAPTURE_RATE);
-    let mut capture = Vec::with_capacity(passes * AUDIO_SECONDS * CAPTURE_RATE as usize);
-    for _ in 0..passes {
-        capture.extend(upsampler.push(mixture));
-    }
+    let capture = build_capture(mixture, passes);
     let pass_len = capture.len() / passes;
     anyhow::ensure!(pass_len > 0, "The benchmark capture is empty");
 
@@ -302,6 +303,93 @@ fn measure_pipeline(
         rtf: best.0 / (CHUNK as f64 / RATE as f64 * 1000.),
         startup_ms,
     })
+}
+
+/// Build `passes` back-to-back captures of the mixture at the device rate.
+fn build_capture(mixture: &[f32], passes: usize) -> Vec<f32> {
+    let mut upsampler = Resampler::new(RATE_U32, CAPTURE_RATE);
+    let mut capture = Vec::with_capacity(passes * AUDIO_SECONDS * CAPTURE_RATE as usize);
+    for _ in 0..passes {
+        capture.extend(upsampler.push(mixture));
+    }
+    capture
+}
+
+/// Paired thread-pool comparison: run both extractors on the same audio in the
+/// same process, alternating which one goes first, and report the best pass.
+/// This removes the cross-run machine drift that makes separate runs useless
+/// for one- or two-millisecond differences.
+fn compare_threads(
+    models: &Path,
+    target: &[f32],
+    mixture: &[f32],
+    specification: &str,
+) -> anyhow::Result<()> {
+    let threads: Vec<usize> = specification
+        .split(',')
+        .map(|value| value.trim().parse::<usize>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| anyhow::anyhow!("BENCH_COMPARE expects two comma-separated thread counts"))?;
+    anyhow::ensure!(
+        threads.len() == 2 && threads.iter().all(|count| *count > 0),
+        "BENCH_COMPARE expects two positive thread counts"
+    );
+    let (first_threads, second_threads) = (threads[0], threads[1]);
+    let first = Extractor::with_threads(models, target, Backend::Cpu, first_threads)?;
+    let second = Extractor::with_threads(models, target, Backend::Cpu, second_threads)?;
+
+    let passes = COMPARE_PASSES + 1;
+    let capture = build_capture(mixture, passes);
+    let pass_len = capture.len() / passes;
+    anyhow::ensure!(pass_len > 0, "The comparison capture is empty");
+
+    let mut first_pipeline = Pipeline::new(first);
+    let mut second_pipeline = Pipeline::new(second);
+    let mut first_ms = Vec::with_capacity(COMPARE_PASSES);
+    let mut second_ms = Vec::with_capacity(COMPARE_PASSES);
+    for (index, pass) in capture[..pass_len * passes].chunks(pass_len).enumerate() {
+        // Alternate order so a warm cache and the scheduler bias do not always
+        // favour the same side.
+        let (a, b) = if index % 2 == 0 {
+            (
+                time_pipeline(&mut first_pipeline, pass)?,
+                time_pipeline(&mut second_pipeline, pass)?,
+            )
+        } else {
+            let b = time_pipeline(&mut second_pipeline, pass)?;
+            let a = time_pipeline(&mut first_pipeline, pass)?;
+            (a, b)
+        };
+        if index > 0 {
+            first_ms.push(a);
+            second_ms.push(b);
+        }
+    }
+    anyhow::ensure!(
+        first_ms.len() == COMPARE_PASSES,
+        "Expected {COMPARE_PASSES} timed passes, got {}",
+        first_ms.len()
+    );
+    let best = |values: &[f64]| values.iter().copied().fold(f64::INFINITY, f64::min);
+    let first_ms = best(&first_ms);
+    let second_ms = best(&second_ms);
+    println!(
+        "threads {first_threads} vs {second_threads}: {first_ms:.3} vs {second_ms:.3} ms per chunk"
+    );
+    println!("METRIC compare_a_ms={first_ms:.3}");
+    println!("METRIC compare_b_ms={second_ms:.3}");
+    println!("METRIC compare_ratio={:.4}", first_ms / second_ms);
+    Ok(())
+}
+
+fn time_pipeline(pipeline: &mut Pipeline, pass: &[f32]) -> anyhow::Result<f64> {
+    let started = Instant::now();
+    let mut chunks = 0usize;
+    for block in pass.chunks(CAPTURE_BLOCK) {
+        chunks += pipeline.push(block)?.0;
+    }
+    anyhow::ensure!(chunks > 0, "The comparison pass produced no blocks");
+    Ok(started.elapsed().as_secs_f64() * 1000. / chunks as f64)
 }
 
 /// Enrollment clip saved by the app: `data/voice.json` first, then the PCM16 WAV.

@@ -237,18 +237,27 @@ pub struct Extractor {
 }
 impl Extractor {
     pub fn new(folder: &Path, sample: &[f32], backend: Backend) -> Result<Self> {
-        let mut enroll = open_session(&folder.join("enroll.onnx"), Backend::Cpu, cpu_threads())?;
+        Self::with_threads(folder, sample, backend, cpu_threads())
+    }
+
+    /// Like [`Extractor::new`] but with an explicit CPU worker count. The
+    /// benchmark uses this to compare pool sizes without touching the process
+    /// environment; normal callers keep the policy in `cpu_threads`.
+    pub fn with_threads(
+        folder: &Path,
+        sample: &[f32],
+        backend: Backend,
+        threads: usize,
+    ) -> Result<Self> {
+        let threads = threads.max(1);
+        let mut enroll = open_session(&folder.join("enroll.onnx"), Backend::Cpu, threads)?;
         // The GPU keeps fewer threads busy; the CPU uses most of the cores.
-        let chunk_threads = if backend == Backend::Cuda {
-            2
-        } else {
-            cpu_threads()
-        };
+        let chunk_threads = if backend == Backend::Cuda { 2 } else { threads };
         let (model, model_name) = chunk_model(folder, backend);
         let (session, engine, note) = match open_session(&model, backend, chunk_threads) {
             Ok(session) => (session, backend, None),
             Err(error) if backend == Backend::Cuda => {
-                let session = open_session(&model, Backend::Cpu, cpu_threads())
+                let session = open_session(&model, Backend::Cpu, threads)
                     .context("The CPU fallback could not load the voice model")?;
                 (
                     session,
