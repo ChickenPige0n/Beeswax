@@ -1049,8 +1049,10 @@ impl Render for Beeswax {
                                                         "CUDA",
                                                         if self.cuda {
                                                             "Runs on the NVIDIA GPU"
+                                                        } else if self.runtime_error.is_some() {
+                                                            "Runtime unavailable"
                                                         } else {
-                                                            "No CUDA provider found"
+                                                            "Requires an NVIDIA GPU"
                                                         },
                                                         self.backend == Backend::Cuda,
                                                         self.cuda && !busy,
@@ -1066,9 +1068,11 @@ impl Render for Beeswax {
                                                 "Runtime providers: {}. CUDA is ready.",
                                                 self.providers
                                             )
+                                        } else if self.runtime_error.is_some() {
+                                            "ONNX Runtime is unavailable, so filtering cannot start. See the error below.".to_owned()
                                         } else {
                                             format!(
-                                                "Runtime providers: {}. CUDA needs an NVIDIA GPU plus onnxruntime-gpu (CUDA 12 / cuDNN 9) beside runtime/onnxruntime.dll; the Intel iGPU cannot use CUDA and needs a DirectML runtime instead. See scripts/setup-cuda-runtime.ps1.",
+                                                "Runtime providers: {}. CUDA is unavailable here; the CPU engine is used.",
                                                 self.providers
                                             )
                                         }))
@@ -1116,11 +1120,11 @@ impl Render for Beeswax {
                                         })
                                         .child(caption(if self.models == "none" {
                                             if model_setup.active {
-                                                "The required CPU model and enrollment model are being installed.".to_owned()
+                                                "Installing the required voice models…".to_owned()
                                             } else if model_setup.error.is_some() {
-                                                "Required models are missing. Retry the download to enable filtering.".to_owned()
+                                                "Required voice models are missing. Retry the download to enable filtering.".to_owned()
                                             } else {
-                                                "No separation model found in models/.".to_owned()
+                                                "No voice model found in models/.".to_owned()
                                             }
                                         } else if self.cuda
                                             && !self.models.contains("fp32")
@@ -1137,7 +1141,7 @@ impl Render for Beeswax {
                                             )
                                         } else {
                                             format!(
-                                                "Models installed: {}. The CPU engine runs int8 for real time; CUDA would use fp32.",
+                                                "Models installed: {}. The CPU engine runs int8 for real time.",
                                                 self.models
                                             )
                                         }))
@@ -1366,16 +1370,18 @@ fn main() -> anyhow::Result<()> {
     let runtime_error = std::panic::catch_unwind(|| initialize_runtime(&root))
         .unwrap_or_else(|_| {
             Err(anyhow::anyhow!(
-                "ONNX Runtime could not initialize. Check the DLL version and architecture."
+                "ONNX Runtime could not initialize. Reinstall Beeswax, or set ORT_DYLIB_PATH to an ONNX Runtime 1.22+ DLL for this architecture."
             ))
         })
         .err()
         .map(|e| format!("{e:#}"));
     if std::env::args().any(|a| a == "--providers") {
+        println!("runtime dll: {}", runtime_dll(&root).display());
         if let Some(error) = &runtime_error {
             println!("runtime error: {error}");
+            println!("providers: unavailable");
+            return Ok(());
         }
-        println!("runtime dll: {}", runtime_dll(&root).display());
         let providers = model::providers();
         println!(
             "providers: {}",
@@ -1464,13 +1470,26 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn runtime_dll(root: &std::path::Path) -> PathBuf {
-    std::env::var_os("ORT_DYLIB_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("runtime/onnxruntime.dll"))
+    if let Some(path) = std::env::var_os("ORT_DYLIB_PATH") {
+        return PathBuf::from(path);
+    }
+    let packaged = root.join("runtime").join("onnxruntime.dll");
+    if packaged.is_file() {
+        return packaged;
+    }
+    // Also accept the DLL copied directly beside beeswax.exe.
+    if let Some(beside) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("onnxruntime.dll")))
+        && beside.is_file()
+    {
+        return beside;
+    }
+    packaged
 }
 
 /// Directories that may hold the CUDA/cuDNN runtime DLLs: the explicit environment
-/// variable, a path list written by scripts/setup-cuda-runtime.ps1, and runtime/cuda.
+/// variable, a hand-written path list in runtime/cuda-path.txt, and runtime/cuda.
 #[cfg(feature = "inference")]
 fn cuda_dll_dirs(root: &std::path::Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -1482,7 +1501,7 @@ fn cuda_dll_dirs(root: &std::path::Path) -> Vec<PathBuf> {
             }
         }
     }
-    if let Ok(list) = std::fs::read_to_string(root.join("runtime/cuda-path.txt")) {
+    if let Ok(list) = std::fs::read_to_string(root.join("runtime").join("cuda-path.txt")) {
         for line in list.lines() {
             let line = line.trim();
             if !line.is_empty() && !line.starts_with('#') {
@@ -1490,7 +1509,7 @@ fn cuda_dll_dirs(root: &std::path::Path) -> Vec<PathBuf> {
             }
         }
     }
-    let local = root.join("runtime/cuda");
+    let local = root.join("runtime").join("cuda");
     if local.is_dir() {
         dirs.push(local);
     }
@@ -1502,7 +1521,7 @@ fn initialize_runtime(root: &std::path::Path) -> anyhow::Result<()> {
     let path = runtime_dll(root);
     anyhow::ensure!(
         path.is_file(),
-        "ONNX Runtime is missing. Run scripts/setup-runtime.ps1 or set ORT_DYLIB_PATH."
+        "ONNX Runtime (onnxruntime.dll) is missing. Reinstall Beeswax from the Windows release package, or set ORT_DYLIB_PATH to an ONNX Runtime 1.22+ DLL."
     );
     // The CUDA provider DLL is loaded by onnxruntime.dll itself; its cublas/cuDNN
     // dependencies must already be resolvable. Put the directory first on PATH so the

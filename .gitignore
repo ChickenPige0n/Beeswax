@@ -4,5 +4,7 @@
 /validation/target/
 /models/*.onnx
 /models/*.download
+/models/*.part
+__pycache__/
 *.log
 

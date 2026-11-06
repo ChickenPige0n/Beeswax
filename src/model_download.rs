@@ -1,30 +1,41 @@
 use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::Duration,
 };
 
-const MINIMUM_MODEL_BYTES: u64 = 1_000_000;
-const VOXLOCK_MODEL_REVISION: &str = "a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03";
-const VOXLOCK_MODEL_URL: &str = "https://huggingface.co/arbazsiddiqui/voxlock/resolve";
-const REQUIRED_MODELS: [(&str, &str, &str); 2] = [
-    (
-        "enroll.onnx",
-        "onnx/enroll.onnx",
-        "86645cba23f207def0b31a6e74a615d3b7a813b4fdf957c53b3af2905ba2ffd3",
-    ),
-    (
-        "chunk_int8.onnx",
-        "onnx/chunk_int8.onnx",
-        "f0d2b0aaf95affe8894ea008d0105be4f5f5354f7244835534c31b1a7dd4699a",
-    ),
-];
+/// Models pinned in models.json at the repository root. The release workflow
+/// vendors the same files, so the download path is only used by source builds
+/// or when the models folder was removed.
+const MODEL_MANIFEST: &str = include_str!("../models.json");
+
+#[derive(Deserialize)]
+struct Manifest {
+    repository: String,
+    revision: String,
+    models: Vec<ManifestModel>,
+}
+
+#[derive(Deserialize)]
+struct ManifestModel {
+    name: String,
+    path: String,
+    bytes: u64,
+    sha256: String,
+}
+
+fn manifest() -> &'static Manifest {
+    static MANIFEST: OnceLock<Manifest> = OnceLock::new();
+    MANIFEST
+        .get_or_init(|| serde_json::from_str(MODEL_MANIFEST).expect("models.json is valid JSON"))
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct State {
@@ -46,19 +57,20 @@ impl State {
 }
 
 pub fn required_models_present(folder: &Path) -> bool {
-    REQUIRED_MODELS.iter().all(|(name, _, _)| {
+    manifest().models.iter().all(|model| {
         folder
-            .join(name)
+            .join(&model.name)
             .metadata()
-            .is_ok_and(|metadata| metadata.len() >= MINIMUM_MODEL_BYTES)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == model.bytes)
     })
 }
 
 pub fn start(folder: PathBuf, state: Arc<Mutex<State>>) {
     {
         let mut current = state.lock().unwrap();
-        if current.active || required_models_present(&folder) {
-            current.ready = required_models_present(&folder);
+        let ready = required_models_present(&folder);
+        if current.active || ready {
+            current.ready = ready;
             current.error = None;
             current.message = None;
             return;
@@ -71,10 +83,16 @@ pub fn start(folder: PathBuf, state: Arc<Mutex<State>>) {
 
     thread::spawn(move || {
         let result = download_required(&folder, |index, file, bytes| {
+            let models = &manifest().models;
+            let total = models
+                .iter()
+                .find(|model| model.name.as_str() == file)
+                .map_or(0, |model| model.bytes);
             state.lock().unwrap().message = Some(format!(
-                "Downloading model {index}/{}: {file} · {:.1} MB",
-                REQUIRED_MODELS.len(),
-                bytes as f64 / 1_000_000.
+                "Downloading voice model {index}/{}: {file} · {:.1} / {:.1} MB",
+                models.len(),
+                bytes as f64 / 1_000_000.,
+                total as f64 / 1_000_000.
             ));
         });
         let mut current = state.lock().unwrap();
@@ -91,18 +109,22 @@ pub fn start(folder: PathBuf, state: Arc<Mutex<State>>) {
 
 fn download_required(folder: &Path, mut progress: impl FnMut(usize, &str, u64)) -> Result<()> {
     std::fs::create_dir_all(folder).context("Could not create the models directory")?;
-    for (index, (name, file, checksum)) in REQUIRED_MODELS.iter().enumerate() {
-        let destination = folder.join(name);
+    let manifest = manifest();
+    for (index, model) in manifest.models.iter().enumerate() {
+        let destination = folder.join(&model.name);
         if destination
             .metadata()
-            .is_ok_and(|metadata| metadata.len() >= MINIMUM_MODEL_BYTES)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == model.bytes)
         {
             continue;
         }
-        progress(index + 1, name, 0);
-        let url = format!("{VOXLOCK_MODEL_URL}/{VOXLOCK_MODEL_REVISION}/{file}");
-        download_file(&url, &destination, checksum, |bytes| {
-            progress(index + 1, name, bytes)
+        progress(index + 1, &model.name, 0);
+        let url = format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            manifest.repository, manifest.revision, model.path
+        );
+        download_file(&url, &destination, &model.sha256, model.bytes, |bytes| {
+            progress(index + 1, &model.name, bytes)
         })?;
     }
     ensure!(
@@ -116,6 +138,7 @@ fn download_file(
     url: &str,
     destination: &Path,
     expected_sha256: &str,
+    expected_bytes: u64,
     mut progress: impl FnMut(u64),
 ) -> Result<()> {
     let partial = destination.with_extension("onnx.download");
@@ -166,8 +189,8 @@ fn download_file(
         .context("Downloaded model file is missing")?
         .len();
     ensure!(
-        length >= MINIMUM_MODEL_BYTES,
-        "Downloaded model file is unexpectedly small ({length} bytes)"
+        length == expected_bytes,
+        "Downloaded model file has the wrong size ({length} bytes, expected {expected_bytes})"
     );
     let actual_sha256 = sha256_file(&partial)?;
     if actual_sha256 != expected_sha256 {
@@ -197,4 +220,24 @@ fn sha256_file(path: &Path) -> Result<String> {
 
 fn curl_program() -> &'static str {
     if cfg!(windows) { "curl.exe" } else { "curl" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_pins_complete_models() {
+        let manifest = manifest();
+        assert!(!manifest.repository.is_empty());
+        assert_eq!(manifest.revision.len(), 40);
+        assert!(!manifest.models.is_empty());
+        for model in &manifest.models {
+            assert!(model.name.ends_with(".onnx"));
+            assert!(model.path.starts_with("onnx/"));
+            assert!(model.bytes > 1_000_000);
+            assert_eq!(model.sha256.len(), 64);
+            assert!(model.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
 }

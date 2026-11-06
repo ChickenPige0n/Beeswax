@@ -10,14 +10,17 @@ import numpy as np
 import onnxruntime as ort
 
 root = Path(__file__).resolve().parents[1]
-model_revision = "a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03"
+manifest = json.loads((root / "models.json").read_text(encoding="utf-8"))
+model_revision = manifest["revision"]
 expected_hashes = {
-    "models/enroll.onnx": "86645cba23f207def0b31a6e74a615d3b7a813b4fdf957c53b3af2905ba2ffd3",
-    "models/chunk_int8.onnx": "f0d2b0aaf95affe8894ea008d0105be4f5f5354f7244835534c31b1a7dd4699a",
+    f"models/{model['name']}": (model["sha256"], int(model["bytes"]))
+    for model in manifest["models"]
 }
-for relative_path, expected_hash in expected_hashes.items():
+for relative_path, (expected_hash, expected_bytes) in expected_hashes.items():
     model_path = root / relative_path
-    actual_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    payload = model_path.read_bytes()
+    assert len(payload) == expected_bytes, f"Unexpected model size: {relative_path}"
+    actual_hash = hashlib.sha256(payload).hexdigest()
     assert actual_hash == expected_hash, f"Unexpected model revision: {relative_path}"
 
 options = ort.SessionOptions()
@@ -42,6 +45,7 @@ for i in range(75):
     assert all(np.isfinite(x).all() for x in [frames, h, c])
 report = {
     "runtime": ort.__version__, "reference": "VoxLock 1.1.1",
+    "model_repository": manifest["repository"],
     "model_revision": model_revision, "interface": "VoxLock 1.1 ONNX",
     "runs": len(times),
     "chunk_ms": 40, "mean_inference_ms": round(float(np.mean(times)), 2),

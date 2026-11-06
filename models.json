@@ -1,0 +1,18 @@
+{
+  "repository": "arbazsiddiqui/voxlock",
+  "revision": "a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03",
+  "models": [
+    {
+      "name": "enroll.onnx",
+      "path": "onnx/enroll.onnx",
+      "bytes": 12475387,
+      "sha256": "86645cba23f207def0b31a6e74a615d3b7a813b4fdf957c53b3af2905ba2ffd3"
+    },
+    {
+      "name": "chunk_int8.onnx",
+      "path": "onnx/chunk_int8.onnx",
+      "bytes": 66608213,
+      "sha256": "f0d2b0aaf95affe8894ea008d0105be4f5f5354f7244835534c31b1a7dd4699a"
+    }
+  ]
+}

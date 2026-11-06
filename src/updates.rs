@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use semver::Version;
-use serde::Deserialize;
 use std::{
     path::Path,
     process::Command,
@@ -12,12 +11,6 @@ use std::{
 pub struct State {
     pub message: Option<String>,
     pub available: Option<(String, String)>,
-}
-
-#[derive(Deserialize)]
-struct Release {
-    tag_name: String,
-    html_url: String,
 }
 
 pub fn repository(root: &Path) -> Option<String> {
@@ -52,12 +45,14 @@ pub fn start(repository: Option<String>, state: Arc<Mutex<State>>) {
     });
 }
 
+/// Ask github.com which release is current instead of using the REST API.
+/// The releases page redirects to /releases/tag/vX.Y.Z and is not subject to
+/// the unauthenticated API's hourly rate limit (which shows up as HTTP 403).
 fn check_latest(repository: &str) -> Result<Option<(String, String)>> {
-    let url = format!("https://api.github.com/repos/{repository}/releases/latest");
+    let url = format!("https://github.com/{repository}/releases/latest");
     let output = Command::new(curl_program())
         .args([
             "--location",
-            "--fail",
             "--silent",
             "--show-error",
             "--connect-timeout",
@@ -67,7 +62,11 @@ fn check_latest(repository: &str) -> Result<Option<(String, String)>> {
             "--user-agent",
             concat!("Beeswax/", env!("CARGO_PKG_VERSION")),
             "--header",
-            "Accept: application/vnd.github+json",
+            "Accept: text/html",
+            "--output",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+            "--write-out",
+            "%{http_code}\n%{url_effective}",
         ])
         .arg(url)
         .output()
@@ -84,26 +83,39 @@ fn check_latest(repository: &str) -> Result<Option<(String, String)>> {
         );
     }
 
-    let release: Release = serde_json::from_slice(&output.stdout)
-        .context("GitHub returned an invalid release response")?;
-    let version = release
-        .tag_name
+    let response = String::from_utf8_lossy(&output.stdout);
+    let mut lines = response.lines();
+    let status = lines.next().unwrap_or_default().trim();
+    let effective_url = lines.next().unwrap_or_default().trim();
+    release_from_redirect(repository, status, effective_url)
+}
+
+fn release_from_redirect(
+    repository: &str,
+    status: &str,
+    effective_url: &str,
+) -> Result<Option<(String, String)>> {
+    match status {
+        "200" => {}
+        "404" => return Ok(None),
+        other => bail!("GitHub returned HTTP {other} for {repository}"),
+    }
+    let prefix = format!("https://github.com/{repository}/releases/tag/");
+    let Some(tag) = effective_url.strip_prefix(&prefix) else {
+        bail!("GitHub returned an unexpected release URL");
+    };
+    if tag.is_empty() || tag.contains('/') || tag.contains('?') {
+        bail!("GitHub returned an unexpected release tag");
+    }
+    let version = tag
         .strip_prefix('v')
-        .or_else(|| release.tag_name.strip_prefix('V'))
-        .unwrap_or(&release.tag_name);
-    let latest = Version::parse(version).with_context(|| {
-        format!(
-            "Release tag is not a semantic version: {}",
-            release.tag_name
-        )
-    })?;
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag);
+    let latest = Version::parse(version)
+        .with_context(|| format!("Release tag is not a semantic version: {tag}"))?;
     let current = Version::parse(env!("CARGO_PKG_VERSION"))?;
     if latest > current {
-        let expected_prefix = format!("https://github.com/{repository}/releases/tag/");
-        if !release.html_url.starts_with(&expected_prefix) {
-            bail!("GitHub returned an unexpected release URL");
-        }
-        Ok(Some((latest.to_string(), release.html_url)))
+        Ok(Some((latest.to_string(), effective_url.to_owned())))
     } else {
         Ok(None)
     }
@@ -163,6 +175,8 @@ fn curl_program() -> &'static str {
 mod tests {
     use super::*;
 
+    const RELEASE: &str = "https://github.com/example/beeswax/releases/tag/v9.9.9";
+
     #[test]
     fn repository_urls_normalize_to_owner_and_repo() {
         assert_eq!(
@@ -174,6 +188,58 @@ mod tests {
             Some("example/beeswax".to_owned())
         );
         assert_eq!(normalize_repository("https://example.com/other/repo"), None);
+    }
+
+    #[test]
+    fn github_release_redirect_is_parsed() {
+        let (version, url) = release_from_redirect("example/beeswax", "200", RELEASE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(version, "9.9.9");
+        assert_eq!(url, RELEASE);
+    }
+
+    #[test]
+    fn missing_or_older_releases_are_not_updates() {
+        assert!(
+            release_from_redirect(
+                "example/beeswax",
+                "404",
+                "https://github.com/example/beeswax/releases"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            release_from_redirect(
+                "example/beeswax",
+                "200",
+                "https://github.com/example/beeswax/releases/tag/v0.0.1"
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unexpected_redirects_and_statuses_are_errors() {
+        assert!(
+            release_from_redirect(
+                "example/beeswax",
+                "200",
+                "https://github.com/example/other/releases/tag/v9.9.9"
+            )
+            .is_err()
+        );
+        assert!(
+            release_from_redirect(
+                "example/beeswax",
+                "200",
+                "https://github.com/example/beeswax/releases"
+            )
+            .is_err()
+        );
+        assert!(release_from_redirect("example/beeswax", "403", "").is_err());
     }
 
     #[test]

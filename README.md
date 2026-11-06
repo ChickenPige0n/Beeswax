@@ -1,36 +1,52 @@
 # Beeswax
 
-A Windows target-speaker virtual microphone built with **gpui-fast**, Rust **ort**, the **VoxLock 1.1.1** streaming implementation and its pinned ONNX model revision, and **VB-CABLE**. A light native interface records enrollment, selects audio endpoints, and starts/stops voice filtering. Missing required models download from the public VoxLock Hugging Face repository on first launch.
+A Windows target-speaker virtual microphone built with **gpui-fast**, Rust **ort**, the **VoxLock 1.1.1** streaming implementation and its pinned ONNX model revision, and **VB-CABLE**. A light native interface records enrollment, selects audio endpoints, and starts/stops voice filtering. Release archives bundle ONNX Runtime and the required models, so a fresh install filters without a setup script or a first-launch model download. Source builds use `python scripts/vendor.py` to fetch the same files once.
 
 After building, launch `target/release/beeswax.exe`.
 
 ## Build and run
 
-Requires Windows x64, Rust/MSVC with the Windows SDK, and VB-CABLE installed. The first app launch downloads the required models into `models/` and verifies them against their recorded SHA-256 checksums:
-
-```
-models/enroll.onnx
-models/chunk_int8.onnx
-```
-
-From the project directory:
+Requires Windows x64, Rust/MSVC with the Windows SDK, Python 3.9+ for the vendoring helper, and VB-CABLE installed. From the project directory:
 
 ```powershell
-# Copies the DLL from an existing Python onnxruntime installation; no download.
-powershell -ExecutionPolicy Bypass -File scripts/setup-runtime.ps1
+python scripts/vendor.py
 cargo build --release --locked
 .\target\release\beeswax.exe
 ```
 
-Alternatively pass `-RuntimeDll C:\path\onnxruntime.dll` to the setup script, or set `ORT_DYLIB_PATH` to that DLL. Use an ONNX Runtime supporting API 22 or newer (the local installation is CPU-only 1.30). The Rust binding is pinned to `ort 2.0.0-rc.10`.
+`scripts/vendor.py` installs the pinned ONNX Runtime 1.30 CPU DLL and the two VoxLock models:
+
+```
+runtime/onnxruntime.dll
+models/enroll.onnx
+models/chunk_int8.onnx
+```
+
+Model hashes, sizes and the upstream revision live in `models.json`; every download is checked against them. Re-running the script is cheap and only downloads what is missing. `python scripts/vendor.py check` verifies without downloading, and `python scripts/vendor.py package` builds the release ZIP.
+
+Release CI restores `runtime/` and `models/` from an `actions/cache` entry keyed by `models.json` and `scripts/vendor.py`. A cache miss downloads and verifies the files; only verified files are packaged. No PowerShell setup scripts are shipped.
+
+The release ZIP is self-contained:
+
+```
+beeswax.exe
+runtime/onnxruntime.dll
+models/enroll.onnx
+models/chunk_int8.onnx
+models.json
+README.md
+LICENSE
+```
+
+Use `ORT_DYLIB_PATH` to point at a different ONNX Runtime DLL, or `BEESWAX_MODELS` to use another models folder. The Rust binding is pinned to `ort 2.0.0-rc.10`; use an ONNX Runtime supporting API 22 or newer.
 
 The default build registers the CUDA execution provider and lets **Processing** choose between **CPU** and **CUDA**; CUDA is preselected when the provider is actually available, and the choice is remembered. CUDA is selectable only when the chosen ONNX Runtime DLL advertises `CUDAExecutionProvider`. **CUDA is NVIDIA-only**: an Intel or AMD integrated GPU cannot run it, no matter which DLL is installed. If a CUDA session cannot start, Beeswax falls back to CPU and shows the reason in the Processing card. Build without CUDA registration with `cargo build --release --no-default-features --features inference`; the choice is remembered in `data/settings.json`.
 
-Beeswax checks the latest GitHub release at startup and compares it with the running version using SemVer. CI builds include the GitHub repository automatically; local builds discover it from `remote.origin.url` or accept `BEESWAX_GITHUB_REPOSITORY=owner/repo`. Tag a version such as `v0.1.1` to publish a Windows x64 release archive.
+Beeswax reads `https://github.com/owner/repo/releases/latest` at startup and compares the redirected tag with the running version using SemVer. This is the public releases page, not the REST API, so it is not subject to the unauthenticated API's hourly rate limit (the cause of the previous HTTP 403 update failures) and needs no token. CI builds embed the GitHub repository automatically; local builds discover it from `remote.origin.url` or accept `BEESWAX_GITHUB_REPOSITORY=owner/repo`. Tag a version such as `v0.1.1` to publish a Windows x64 release archive.
 
-### Enabling CUDA
+### Enabling CUDA (optional)
 
-A GPU and a display driver are not enough: the normal ONNX Runtime wheel is CPU-only, so `runtime/onnxruntime.dll` exposes only `CPUExecutionProvider`. Check what you have:
+The vendored runtime is the CPU build, so `--providers` reports only `CPU` and the Processing card keeps CUDA disabled. A GPU and a display driver are not enough: the CPU runtime has no CUDA provider. Check what is installed:
 
 ```powershell
 .\target\release\beeswax.exe --providers
@@ -39,23 +55,19 @@ A GPU and a display driver are not enough: the normal ONNX Runtime wheel is CPU-
 # cuda available: false
 ```
 
-Install the GPU build and its CUDA 12 / cuDNN 9 dependencies:
+To use CUDA, replace the runtime with the GPU build and provide CUDA 12 / cuDNN 9:
+
+1. Download the ONNX Runtime 1.30 CUDA 12 GPU package for Windows x64 from the [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases/tag/v1.30.0) (`onnxruntime-win-x64-gpu_cuda12-1.30.0.zip`). The CPU package has no `onnxruntime_providers_cuda.dll`.
+2. Copy `lib/onnxruntime.dll`, `lib/onnxruntime_providers_cuda.dll` and `lib/onnxruntime_providers_shared.dll` into `runtime/`, replacing the CPU DLL.
+3. Make the CUDA/cuDNN DLLs resolvable: put them in `runtime/cuda/`, set `BEESWAX_CUDA_DLLS` to semicolon-separated folders, or write one folder per line to `runtime/cuda-path.txt`. PyTorch's `lib` folder is a convenient source for the CUDA 12 / cuDNN 9 DLLs.
+4. Verify the result:
 
 ```powershell
-# 1. Grab the GPU wheel (the CPU wheel has no onnxruntime_providers_cuda.dll).
-python -m pip download --no-deps --dest .\target\ort-gpu onnxruntime-gpu==1.30.0
-
-# 2. Copy its runtime next to Beeswax and point at a CUDA 12 / cuDNN 9 DLL folder.
-#    Without -CudaDllDir the script looks inside PyTorch, which bundles both.
-powershell -ExecutionPolicy Bypass -File scripts/setup-cuda-runtime.ps1 `
-  -OrtWheel .\target\ort-gpu\onnxruntime_gpu-1.30.0-*.whl [-CudaDllDir 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin']
-
-# 3. Verify.
 .\target\release\beeswax.exe --providers      # -> providers: CPU, CUDA
 .\target\release\beeswax.exe --self-test --cuda
 ```
 
-The script backs up the previous runtime as `runtime/onnxruntime-cpu.dll`, copies `onnxruntime.dll` and `onnxruntime_providers_cuda.dll` into `runtime/`, and writes `runtime/cuda-path.txt`. Beeswax puts that folder first on `PATH` and preloads the CUDA/cuDNN DLLs from it (or from `BEESWAX_CUDA_DLLS`, semicolon-separated) before ONNX Runtime starts. Do not copy 1.5 GB of cuDNN DLLs into the project — pointing at the folder is enough.
+Beeswax puts those folders first on `PATH` and preloads the CUDA/cuDNN DLLs before ONNX Runtime starts. Do not copy 1.5 GB of cuDNN DLLs into the project — pointing at the folder is enough. To go back to the bundled CPU runtime, run `python scripts/vendor.py runtime --force`.
 
 Measured on the development laptop (RTX 3050 Laptop 4 GB, i7-12700H) with a game holding ~2.9 GB of VRAM:
 
@@ -72,7 +84,7 @@ Laptop GPUs are commonly 4 GB. A game holding most of the VRAM makes the CUDA se
 
 The Intel iGPU cannot use CUDA. It would need a DirectML (or OpenVINO) build of ONNX Runtime, which Beeswax can report in `--providers` but does not expose as a backend yet.
 
-Cargo must have access to its registry for the initial build. An environment with `CARGO_NET_OFFLINE=true` needs all dependencies pre-cached; the full inference build cannot run with only the UI dependencies cached. The app uses Windows' bundled `curl.exe` to download models and check for updates.
+Cargo must have access to its registry for the initial build. An environment with `CARGO_NET_OFFLINE=true` needs all dependencies pre-cached; the full inference build cannot run with only the UI dependencies cached. Filtering is fully offline after installation: ONNX Runtime and the models are bundled. The app uses Windows' bundled `curl.exe` only when a models folder is missing those files, and to read the public GitHub releases page for update checks.
 
 ## Use
 
@@ -99,7 +111,7 @@ If the meter does not respond, click **Test microphone** and read the status mes
 
 Physical microphone → WASAPI/CPAL → mono → streaming polyphase sinc resampler → 16 kHz / 40 ms blocks → VoxLock via ort → weighted overlap-add → cable-rate resampling → VB-CABLE playback endpoint. Resampling uses precomputed fractional-delay coefficients to avoid recalculating trigonometric weights for every sample.
 
-The downloaded graphs use `enroll_mag` and `context`, with recurrent `h/c` state `[6,32,256]`. VoxLock 1.1.1's reference implementation pins the ONNX files to Hugging Face revision `a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03`; those weights expose the **1.1 ONNX interface**, not the incompatible v2 graphs. The 1.1.1 release changes automatic `live()` enrollment, while Beeswax uses explicit enrollment. The implementation preserves recurrent state, reflects the initial 256 samples, uses 512-sample frames with a 128-sample hop, and applies squared-Hann overlap normalization and the upstream -0.5 output scale.
+The bundled graphs use `enroll_mag` and `context`, with recurrent `h/c` state `[6,32,256]`. VoxLock 1.1.1's reference implementation pins the ONNX files to Hugging Face revision `a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03`; those weights expose the **1.1 ONNX interface**, not the incompatible v2 graphs. The 1.1.1 release changes automatic `live()` enrollment, while Beeswax uses explicit enrollment. The implementation preserves recurrent state, reflects the initial 256 samples, uses 512-sample frames with a 128-sample hop, and applies squared-Hann overlap normalization and the upstream -0.5 output scale.
 
 Audio callbacks use bounded lock-free rings; model work runs on a worker thread. Missing samples produce silence. Capture and playback overload drop samples, trim stale capture when the model falls behind so latency stays bounded, and report the gap while keeping the session alive; repeated ONNX/device errors stop the stream, with no raw-audio bypass. Device IDs are used for opening endpoints rather than unstable enumeration positions. A stopped stream can be refreshed and restarted after device reconnection.
 
@@ -111,7 +123,7 @@ The shipped separator is `models/chunk_int8.onnx`: a 16 kHz model with int8-quan
 
 Ways to get better sound, in order of impact:
 
-1. **Use a higher-precision model with CUDA.** Put `chunk.onnx` (fp32, the Hugging Face `onnx/chunk.onnx`) in `models/`; CUDA then runs fp32 while CPU keeps using int8. `scripts/fetch-model.ps1 -Precision fp32` downloads it. fp32 alone on CPU is slower than real time, so keep this combo on the GPU.
+1. **Use a higher-precision model with CUDA.** Download `onnx/chunk.onnx` (fp32) from the pinned [Hugging Face revision](https://huggingface.co/arbazsiddiqui/voxlock/tree/a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03/onnx) and put it in `models/`; CUDA then runs fp32 while CPU keeps using int8. fp32 alone on CPU is slower than real time, so keep this combo on the GPU.
 2. **Use the CUDA backend.** CPU inference on this laptop already needs about 2.8 s per 3 s of audio at int8; fp32 or a busy machine will drop audio, and dropped audio sounds like crackle and gaps.
 3. **Check the Processing card while filtering.** Growing `gaps` or `dropped` counts mean the audio you hear is being cut, not that the model is noisy.
 4. **Listen directly through headphones** instead of a call app, which may apply its own noise suppression, AGC or compression.
@@ -128,6 +140,7 @@ There is no guarantee of completely removing other speakers. A clean enrollment 
 ## Verification
 
 ```powershell
+python scripts/vendor.py check
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
@@ -138,7 +151,7 @@ cargo run --release -- --self-test --cuda   # prints the effective engine and an
 python scripts/verify-model.py
 ```
 
-The Rust smoke test uses synthetic audio, exercises enrollment and streaming, and checks finite output and sample count. The Python check validates the actual local model contract and measures inference time independently; it does not test the Rust binding. Neither measures speaker separation quality.
+The Rust smoke test uses synthetic audio, exercises enrollment and streaming, and checks finite output and sample count. The Python check requires the `onnxruntime` and `numpy` packages, validates the actual local model contract, and measures inference time independently; it does not test the Rust binding. Neither measures speaker separation quality.
 
 For UI/audio development in an offline environment without the ort crates:
 
@@ -153,9 +166,10 @@ Hardware acceptance: enroll a real voice, record CABLE Output in a separate app 
 
 ## Sources and licensing
 
-Beeswax source code is licensed under MIT; see `LICENSE`. VoxLock's reference implementation and downloaded ONNX model files remain Apache-2.0 and are not relicensed by Beeswax. The model files are downloaded from the pinned upstream revision above. GPUI Fast and other dependencies retain their own licenses; VB-CABLE is a separate VB-Audio product.
+Beeswax source code is licensed under MIT; see `LICENSE`. VoxLock's reference implementation and the bundled ONNX model files remain Apache-2.0 and are not relicensed by Beeswax. The models are redistributed from the pinned upstream revision recorded in `models.json`. GPUI Fast and other dependencies retain their own licenses; VB-CABLE is a separate VB-Audio product.
 
 - [gpui-fast](https://github.com/longbridge/gpui-fast) — native UI, Apache-2.0.
 - [ort](https://github.com/pykeio/ort) — Rust ONNX Runtime binding.
+- [ONNX Runtime](https://github.com/microsoft/onnxruntime) — inference runtime, MIT; the Windows x64 DLL is redistributed unmodified.
 - [VoxLock 1.1.1 streaming reference](https://github.com/arbazsiddiqui/voxlock/blob/v1.1.1/voxlock/core.py) and [Apache-2.0 model repository](https://huggingface.co/arbazsiddiqui/voxlock).
 - [VB-CABLE routing](https://vb-audio.com/Cable/) — separately installed virtual driver.

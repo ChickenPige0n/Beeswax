@@ -21,6 +21,25 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Restore vendored ONNX Runtime and voice models
+        id: vendor-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            runtime
+            models
+          key: beeswax-vendor-v1-${{ hashFiles('models.json', 'scripts/vendor.py') }}
+      - name: Vendor ONNX Runtime and voice models
+        run: python scripts/vendor.py
+      - name: Save vendored ONNX Runtime and voice models
+        if: steps.vendor-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            runtime
+            models
+          key: beeswax-vendor-v1-${{ hashFiles('models.json', 'scripts/vendor.py') }}
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
@@ -29,6 +48,10 @@ jobs:
         run: cargo test --locked
       - name: Build release binary
         run: cargo build --release --locked
+      - name: Smoke-test the vendored runtime and models
+        run: |
+          .\target\release\beeswax.exe --providers
+          .\target\release\beeswax.exe --self-test
       - name: Verify release tag version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -40,11 +63,7 @@ jobs:
             throw "Tag v$tagVersion does not match Cargo.toml version $packageVersion."
           }
       - name: Package Windows app
-        shell: pwsh
-        run: >-
-          Compress-Archive -Force -Path target/release/beeswax.exe, LICENSE,
-          scripts/setup-runtime.ps1, scripts/setup-cuda-runtime.ps1,
-          scripts/fetch-model.ps1, README.md -DestinationPath target/beeswax-windows-x64.zip
+        run: python scripts/vendor.py package
       - uses: actions/upload-artifact@v4
         with:
           name: beeswax-windows-x64
