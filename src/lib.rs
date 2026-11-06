@@ -6,6 +6,7 @@ pub mod model;
 #[cfg(not(feature = "inference"))]
 #[path = "model_disabled.rs"]
 pub mod model;
+pub mod runtime;
 
 /// Which ONNX Runtime execution provider runs the separation model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

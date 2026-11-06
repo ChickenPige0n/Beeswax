@@ -39,24 +39,40 @@ fn main() -> anyhow::Result<()> {
     let interference = load_interference(&root, &target)?;
     let mixture = mix(&target, &interference);
 
+    if let Ok(specification) = std::env::var("BENCH_BACKENDS") {
+        return compare_backends(&models, &target, &mixture, &specification);
+    }
     if let Ok(specification) = std::env::var("BENCH_COMPARE") {
         return compare_threads(&models, &target, &mixture, &specification);
     }
 
+    let backend = configured_backend();
     let cache = ModelCache::new();
     let started = Instant::now();
-    let cold = cache.acquire(&models, &target, Backend::Cpu)?;
+    let cold = cache.acquire(&models, &target, backend)?;
     let startup_ms = started.elapsed().as_secs_f64() * 1000.;
     // Filtering stopped, the app released the sessions, and the user pressed
-    // Start again. This is the path the cache makes cheap.
-    cache.release(&models, &target, Backend::Cpu, cold);
+    // Start again. This is the path the cache makes cheap. CUDA sessions are
+    // released, so the second start reloads them.
+    cache.release(&models, &target, backend, cold);
     let restart = Instant::now();
-    let mut extractor = cache.acquire(&models, &target, Backend::Cpu)?;
+    let mut extractor = cache.acquire(&models, &target, backend)?;
     let warm_start_ms = restart.elapsed().as_secs_f64() * 1000.;
+    if backend == Backend::Cuda && extractor.engine() != Backend::Cuda {
+        anyhow::bail!(
+            "CUDA was requested but the session fell back to {}: {}",
+            extractor.engine(),
+            extractor.note().unwrap_or("no note")
+        );
+    }
 
     let quality = measure_quality(&mut extractor, &target, &interference, &mixture)?;
     let perf = measure_pipeline(extractor, &mixture, startup_ms)?;
 
+    println!(
+        "METRIC backend_is_cuda={}",
+        if backend == Backend::Cuda { 1 } else { 0 }
+    );
     println!("METRIC chunk_latency_ms={:.3}", perf.chunk_ms);
     println!("METRIC chunk_latency_median_ms={:.3}", perf.chunk_median_ms);
     println!("METRIC chunk_latency_max_ms={:.3}", perf.chunk_max_ms);
@@ -79,17 +95,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn init_runtime(root: &Path) -> anyhow::Result<()> {
-    let path = root.join("runtime").join("onnxruntime.dll");
-    anyhow::ensure!(
-        path.is_file(),
-        "{} is missing; run `python scripts/vendor.py runtime` first",
-        path.display()
-    );
-    ort::init_from(path.to_string_lossy())
-        .with_name("BeeswaxBench")
-        .with_telemetry(false)
-        .commit()?;
-    Ok(())
+    beeswax::runtime::initialize(root)
+}
+
+fn configured_backend() -> Backend {
+    match std::env::var("BENCH_BACKEND").ok().as_deref() {
+        Some("cuda" | "CUDA") => Backend::Cuda,
+        _ => Backend::Cpu,
+    }
 }
 
 /// Benchmark the pipeline's capability rather than the background load: the
@@ -329,6 +342,80 @@ fn build_capture(mixture: &[f32], passes: usize) -> Vec<f32> {
 /// same process, alternating which one goes first, and report the best pass.
 /// This removes the cross-run machine drift that makes separate runs useless
 /// for one- or two-millisecond differences.
+fn compare_backends(
+    models: &Path,
+    target: &[f32],
+    mixture: &[f32],
+    specification: &str,
+) -> anyhow::Result<()> {
+    let names: Vec<&str> = specification.split(',').map(str::trim).collect();
+    anyhow::ensure!(
+        names.len() == 2,
+        "BENCH_BACKENDS expects two comma-separated backends (cpu, cuda)"
+    );
+    let parse = |name: &str| -> anyhow::Result<Backend> {
+        match name {
+            "cpu" => Ok(Backend::Cpu),
+            "cuda" => Ok(Backend::Cuda),
+            other => anyhow::bail!("Unknown backend {other}; expected cpu or cuda"),
+        }
+    };
+    let first_backend = parse(names[0])?;
+    let second_backend = parse(names[1])?;
+    let first = Extractor::new(models, target, first_backend)?;
+    let second = Extractor::new(models, target, second_backend)?;
+    for (requested, extractor) in [(first_backend, &first), (second_backend, &second)] {
+        anyhow::ensure!(
+            extractor.engine() == requested,
+            "{} was requested but the session fell back to {}: {}",
+            requested,
+            extractor.engine(),
+            extractor.note().unwrap_or("no note")
+        );
+    }
+
+    let passes = COMPARE_PASSES + 1;
+    let capture = build_capture(mixture, passes);
+    let pass_len = capture.len() / passes;
+    anyhow::ensure!(pass_len > 0, "The comparison capture is empty");
+
+    let mut first_pipeline = Pipeline::new(first);
+    let mut second_pipeline = Pipeline::new(second);
+    let mut first_ms = Vec::with_capacity(COMPARE_PASSES);
+    let mut second_ms = Vec::with_capacity(COMPARE_PASSES);
+    for (index, pass) in capture[..pass_len * passes].chunks(pass_len).enumerate() {
+        let (a, b) = if index % 2 == 0 {
+            (
+                time_pipeline(&mut first_pipeline, pass)?,
+                time_pipeline(&mut second_pipeline, pass)?,
+            )
+        } else {
+            let b = time_pipeline(&mut second_pipeline, pass)?;
+            let a = time_pipeline(&mut first_pipeline, pass)?;
+            (a, b)
+        };
+        if index > 0 {
+            first_ms.push(a);
+            second_ms.push(b);
+        }
+    }
+    anyhow::ensure!(
+        first_ms.len() == COMPARE_PASSES,
+        "Expected {COMPARE_PASSES} timed passes, got {}",
+        first_ms.len()
+    );
+    let best = |values: &[f64]| values.iter().copied().fold(f64::INFINITY, f64::min);
+    let first_ms = best(&first_ms);
+    let second_ms = best(&second_ms);
+    println!(
+        "backends {first_backend} vs {second_backend}: {first_ms:.3} vs {second_ms:.3} ms per chunk"
+    );
+    println!("METRIC compare_a_ms={first_ms:.3}");
+    println!("METRIC compare_b_ms={second_ms:.3}");
+    println!("METRIC compare_ratio={:.4}", first_ms / second_ms);
+    Ok(())
+}
+
 fn compare_threads(
     models: &Path,
     target: &[f32],

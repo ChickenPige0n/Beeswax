@@ -102,12 +102,11 @@ impl Beeswax {
         } else {
             "unavailable".to_owned()
         };
-        // With no saved choice, use the GPU when it actually works; a failed CUDA
-        // session still falls back to CPU with the reason shown in the card.
+        // Default to CPU: on the development laptop it beats the CUDA fp32 path in
+        // latency and separation quality, restarts from the session cache instead of
+        // reloading, and leaves the GPU to games. A saved CUDA choice is honored.
         let backend = match profile::load_backend(&data_dir) {
-            Some(Backend::Cpu) => Backend::Cpu,
             Some(Backend::Cuda) if cuda => Backend::Cuda,
-            _ if cuda => Backend::Cuda,
             _ => Backend::Cpu,
         };
         let model_setup = Arc::new(Mutex::new(model_download::State::for_directory(&model_dir)));
@@ -1376,7 +1375,7 @@ fn main() -> anyhow::Result<()> {
         job.cancel();
         return Ok(());
     }
-    let runtime_error = std::panic::catch_unwind(|| initialize_runtime(&root))
+    let runtime_error = std::panic::catch_unwind(|| beeswax::runtime::initialize(&root))
         .unwrap_or_else(|_| {
             Err(anyhow::anyhow!(
                 "ONNX Runtime could not initialize. Reinstall Beeswax, or set ORT_DYLIB_PATH to an ONNX Runtime 1.22+ DLL for this architecture."
@@ -1385,7 +1384,10 @@ fn main() -> anyhow::Result<()> {
         .err()
         .map(|e| format!("{e:#}"));
     if std::env::args().any(|a| a == "--providers") {
-        println!("runtime dll: {}", runtime_dll(&root).display());
+        println!(
+            "runtime dll: {}",
+            beeswax::runtime::runtime_dll(&root).display()
+        );
         if let Some(error) = &runtime_error {
             println!("runtime error: {error}");
             println!("providers: unavailable");
@@ -1403,7 +1405,7 @@ fn main() -> anyhow::Result<()> {
         println!("cuda available: {}", model::cuda_available());
         #[cfg(feature = "inference")]
         {
-            let dirs = cuda_dll_dirs(&root);
+            let dirs = beeswax::runtime::cuda_dll_dirs(&root);
             println!(
                 "cuda dll dirs: {}",
                 if dirs.is_empty() {
@@ -1476,90 +1478,4 @@ fn main() -> anyhow::Result<()> {
         cx.activate(true);
     });
     Ok(())
-}
-
-fn runtime_dll(root: &std::path::Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("ORT_DYLIB_PATH") {
-        return PathBuf::from(path);
-    }
-    let packaged = root.join("runtime").join("onnxruntime.dll");
-    if packaged.is_file() {
-        return packaged;
-    }
-    // Also accept the DLL copied directly beside beeswax.exe.
-    if let Some(beside) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("onnxruntime.dll")))
-        && beside.is_file()
-    {
-        return beside;
-    }
-    packaged
-}
-
-/// Directories that may hold the CUDA/cuDNN runtime DLLs: the explicit environment
-/// variable, a hand-written path list in runtime/cuda-path.txt, and runtime/cuda.
-#[cfg(feature = "inference")]
-fn cuda_dll_dirs(root: &std::path::Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(value) = std::env::var("BEESWAX_CUDA_DLLS") {
-        for entry in value.split(';') {
-            let entry = entry.trim();
-            if !entry.is_empty() {
-                dirs.push(PathBuf::from(entry));
-            }
-        }
-    }
-    if let Ok(list) = std::fs::read_to_string(root.join("runtime").join("cuda-path.txt")) {
-        for line in list.lines() {
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with('#') {
-                dirs.push(PathBuf::from(line));
-            }
-        }
-    }
-    let local = root.join("runtime").join("cuda");
-    if local.is_dir() {
-        dirs.push(local);
-    }
-    dirs
-}
-
-#[cfg(feature = "inference")]
-fn initialize_runtime(root: &std::path::Path) -> anyhow::Result<()> {
-    let path = runtime_dll(root);
-    anyhow::ensure!(
-        path.is_file(),
-        "ONNX Runtime (onnxruntime.dll) is missing. Reinstall Beeswax from the Windows release package, or set ORT_DYLIB_PATH to an ONNX Runtime 1.22+ DLL."
-    );
-    // The CUDA provider DLL is loaded by onnxruntime.dll itself; its cublas/cuDNN
-    // dependencies must already be resolvable. Put the directory first on PATH so the
-    // loader can resolve them by name, then preload them by absolute path.
-    let dirs = cuda_dll_dirs(root);
-    if !dirs.is_empty() {
-        let existing = std::env::var_os("PATH").unwrap_or_default();
-        let mut entries: Vec<PathBuf> = dirs.to_vec();
-        entries.extend(std::env::split_paths(&existing));
-        if let Ok(joined) = std::env::join_paths(entries) {
-            // SAFETY: this runs during startup, before the UI and audio threads exist.
-            unsafe { std::env::set_var("PATH", joined) };
-        }
-        for error in model::preload_cuda_dylibs(&dirs) {
-            if std::env::var_os("BEESWAX_DEBUG").is_some() {
-                eprintln!("CUDA DLL preload: {error}");
-            }
-        }
-    }
-    ort::init_from(path.to_string_lossy())
-        .with_name("Beeswax")
-        .with_telemetry(false)
-        .commit()?;
-    Ok(())
-}
-
-#[cfg(not(feature = "inference"))]
-fn initialize_runtime(_: &std::path::Path) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "Enrollment/UI development build. Rebuild with default features to enable filtering."
-    )
 }
