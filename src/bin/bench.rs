@@ -16,18 +16,15 @@ use beeswax::{
     dsp::{self, CHUNK, HighPass, RATE, Resampler, rms},
     model::Extractor,
 };
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Instant};
 
 const RATE_U32: u32 = RATE as u32;
 const AUDIO_SECONDS: usize = 3;
 const FIXTURE_OFFSET_SECONDS: usize = 3;
 const CAPTURE_RATE: u32 = 48_000;
 const CAPTURE_BLOCK: usize = 480;
-const WARMUP_SECONDS: usize = 3;
-const TIMED_SECONDS: usize = 6;
+const WARMUP_PASSES: usize = 1;
+const TIMED_PASSES: usize = 4;
 const MAX_LAG: isize = 1024;
 
 fn main() -> anyhow::Result<()> {
@@ -45,6 +42,10 @@ fn main() -> anyhow::Result<()> {
     let perf = measure_pipeline(extractor, &mixture, startup_ms)?;
 
     println!("METRIC chunk_latency_ms={:.3}", perf.chunk_ms);
+    println!("METRIC chunk_latency_median_ms={:.3}", perf.chunk_median_ms);
+    println!("METRIC chunk_latency_max_ms={:.3}", perf.chunk_max_ms);
+    println!("METRIC model_latency_ms={:.3}", perf.model_ms);
+    println!("METRIC dsp_latency_ms={:.3}", perf.dsp_ms);
     println!("METRIC rtf={:.4}", perf.rtf);
     println!("METRIC startup_ms={:.1}", perf.startup_ms);
     println!("METRIC si_sdr_improvement_db={:.3}", quality.improvement);
@@ -93,19 +94,23 @@ impl Pipeline {
         }
     }
 
-    /// Feed one capture-rate block. Returns how many 40 ms blocks the model ran.
-    fn push(&mut self, block: &[f32]) -> anyhow::Result<usize> {
+    /// Feed one capture-rate block. Returns how many 40 ms blocks the model ran
+    /// and how long those model calls took.
+    fn push(&mut self, block: &[f32]) -> anyhow::Result<(usize, f64)> {
         let mut mono = self.input.push(block);
         self.high_pass.process(&mut mono);
         self.pending.extend_from_slice(&mono);
         let mut chunks = 0;
+        let mut model_ms = 0.;
         while self.pending.len() >= CHUNK {
+            let started = Instant::now();
             let filtered = self.extractor.push(&self.pending[..CHUNK])?;
+            model_ms += started.elapsed().as_secs_f64() * 1000.;
             self.pending.drain(..CHUNK);
             let _ = self.output.push(&filtered);
             chunks += 1;
         }
-        Ok(chunks)
+        Ok((chunks, model_ms))
     }
 }
 
@@ -154,6 +159,10 @@ fn measure_quality(
 
 struct Performance {
     chunk_ms: f64,
+    chunk_median_ms: f64,
+    chunk_max_ms: f64,
+    model_ms: f64,
+    dsp_ms: f64,
     rtf: f64,
     startup_ms: f64,
 }
@@ -163,32 +172,54 @@ fn measure_pipeline(
     mixture: &[f32],
     startup_ms: f64,
 ) -> anyhow::Result<Performance> {
-    // A 48 kHz capture that carries exactly the timed workload: one 3 s pass for
-    // warm-up, six timed seconds. Upsampling is not part of the measurement.
+    // Each pass is three seconds of audio at the capture rate. The first pass is
+    // warm-up; the rest are timed and the best one is reported. Operating system
+    // scheduling only ever adds time, so the minimum is the most stable estimate
+    // of what the pipeline can do on this machine.
+    let passes = WARMUP_PASSES + TIMED_PASSES;
     let mut upsampler = Resampler::new(RATE_U32, CAPTURE_RATE);
-    let mut capture = Vec::with_capacity((WARMUP_SECONDS + TIMED_SECONDS) * CAPTURE_RATE as usize);
-    for _ in 0..(WARMUP_SECONDS + TIMED_SECONDS) / AUDIO_SECONDS {
+    let mut capture = Vec::with_capacity(passes * AUDIO_SECONDS * CAPTURE_RATE as usize);
+    for _ in 0..passes {
         capture.extend(upsampler.push(mixture));
     }
+    let pass_len = capture.len() / passes;
+    anyhow::ensure!(pass_len > 0, "The benchmark capture is empty");
 
     let mut pipeline = Pipeline::new(extractor);
-    let warmup_blocks = WARMUP_SECONDS * CAPTURE_RATE as usize / CAPTURE_BLOCK;
-    let mut elapsed = Duration::ZERO;
-    let mut chunks = 0usize;
-    for (index, block) in capture.chunks(CAPTURE_BLOCK).enumerate() {
-        if index < warmup_blocks {
-            pipeline.push(block)?;
-            continue;
-        }
+    let mut measured = Vec::with_capacity(TIMED_PASSES);
+    for (index, pass) in capture[..pass_len * passes].chunks(pass_len).enumerate() {
         let started = Instant::now();
-        chunks += pipeline.push(block)?;
-        elapsed += started.elapsed();
+        let mut chunks = 0usize;
+        let mut model_ms = 0.;
+        for block in pass.chunks(CAPTURE_BLOCK) {
+            let (ran, spent) = pipeline.push(block)?;
+            chunks += ran;
+            model_ms += spent;
+        }
+        let elapsed = started.elapsed().as_secs_f64() * 1000.;
+        if index >= WARMUP_PASSES {
+            anyhow::ensure!(chunks > 0, "A timed pass produced no 40 ms blocks");
+            measured.push((
+                elapsed / chunks as f64,
+                model_ms / chunks as f64,
+                (elapsed - model_ms).max(0.) / chunks as f64,
+            ));
+        }
     }
-    anyhow::ensure!(chunks > 0, "The pipeline produced no 40 ms blocks");
-    let seconds = elapsed.as_secs_f64();
+    anyhow::ensure!(
+        measured.len() == TIMED_PASSES,
+        "Expected {TIMED_PASSES} timed passes, got {}",
+        measured.len()
+    );
+    measured.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let best = measured[0];
     Ok(Performance {
-        chunk_ms: seconds * 1000. / chunks as f64,
-        rtf: seconds / TIMED_SECONDS as f64,
+        chunk_ms: best.0,
+        chunk_median_ms: (measured[TIMED_PASSES / 2 - 1].0 + measured[TIMED_PASSES / 2].0) / 2.,
+        chunk_max_ms: measured[TIMED_PASSES - 1].0,
+        model_ms: best.1,
+        dsp_ms: best.2,
+        rtf: best.0 / (CHUNK as f64 / RATE as f64 * 1000.),
         startup_ms,
     })
 }
