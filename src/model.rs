@@ -110,8 +110,10 @@ fn cpu_threads() -> usize {
             std::thread::available_parallelism()
                 .map(|count| count.get())
                 .unwrap_or(4)
+                // The int8 LSTMs plateau before saturating a larger host; leaving a
+                // little more CPU headroom also keeps capture and playback responsive.
                 .saturating_sub(2)
-                .clamp(2, 8)
+                .clamp(2, 6)
         })
 }
 

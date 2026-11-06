@@ -26,7 +26,7 @@ Alternatively pass `-RuntimeDll C:\path\onnxruntime.dll` to the setup script, or
 
 The default build registers the CUDA execution provider and lets **Processing** choose between **CPU** and **CUDA**; CUDA is preselected when the provider is actually available, and the choice is remembered. CUDA is selectable only when the chosen ONNX Runtime DLL advertises `CUDAExecutionProvider`. **CUDA is NVIDIA-only**: an Intel or AMD integrated GPU cannot run it, no matter which DLL is installed. If a CUDA session cannot start, Beeswax falls back to CPU and shows the reason in the Processing card. Build without CUDA registration with `cargo build --release --no-default-features --features inference`; the choice is remembered in `data/settings.json`.
 
-Beeswax checks the latest GitHub release at startup and compares it with the running version using SemVer. CI builds include the GitHub repository automatically; local builds discover it from `remote.origin.url` or accept `BEESWAX_GITHUB_REPOSITORY=owner/repo`. Tag a version such as `v0.2.0` to publish a Windows x64 release archive.
+Beeswax checks the latest GitHub release at startup and compares it with the running version using SemVer. CI builds include the GitHub repository automatically; local builds discover it from `remote.origin.url` or accept `BEESWAX_GITHUB_REPOSITORY=owner/repo`. Tag a version such as `v0.1.1` to publish a Windows x64 release archive.
 
 ### Enabling CUDA
 
@@ -61,7 +61,7 @@ Measured on the development laptop (RTX 3050 Laptop 4 GB, i7-12700H) with a game
 
 | engine + model | 3 s of audio |
 |---|---|
-| CPU + int8 | 2.85 s |
+| CPU + int8 | 2.7 s |
 | CPU + fp32 | 4.40 s |
 | CUDA + int8 | 5.35 s (int8 LSTM nodes stay on the CPU) |
 | CUDA + fp32 | 2.74 s |
@@ -97,13 +97,13 @@ If the meter does not respond, click **Test microphone** and read the status mes
 
 ## Audio pipeline
 
-Physical microphone → WASAPI/CPAL → mono → streaming sinc resampler → 16 kHz / 40 ms blocks → VoxLock via ort → weighted overlap-add → cable-rate resampling → VB-CABLE playback endpoint.
+Physical microphone → WASAPI/CPAL → mono → streaming polyphase sinc resampler → 16 kHz / 40 ms blocks → VoxLock via ort → weighted overlap-add → cable-rate resampling → VB-CABLE playback endpoint. Resampling uses precomputed fractional-delay coefficients to avoid recalculating trigonometric weights for every sample.
 
 The downloaded graphs use `enroll_mag` and `context`, with recurrent `h/c` state `[6,32,256]`. VoxLock 1.1.1's reference implementation pins the ONNX files to Hugging Face revision `a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03`; those weights expose the **1.1 ONNX interface**, not the incompatible v2 graphs. The 1.1.1 release changes automatic `live()` enrollment, while Beeswax uses explicit enrollment. The implementation preserves recurrent state, reflects the initial 256 samples, uses 512-sample frames with a 128-sample hop, and applies squared-Hann overlap normalization and the upstream -0.5 output scale.
 
 Audio callbacks use bounded lock-free rings; model work runs on a worker thread. Missing samples produce silence. Capture and playback overload drop samples, trim stale capture when the model falls behind so latency stays bounded, and report the gap while keeping the session alive; repeated ONNX/device errors stop the stream, with no raw-audio bypass. Device IDs are used for opening endpoints rather than unstable enumeration positions. A stopped stream can be refreshed and restarted after device reconnection.
 
-CPU inference runs the separation graph on all but two logical cores (at most eight; override with `BEESWAX_THREADS`). On the development laptop (i7-12700H) the int8 model needs about 2.8 s of CPU time per 3 s of audio with eight threads, so a busy machine can still fall behind; the stream then drops audio instead of stopping. The engine picks its model automatically: **CPU runs the int8 model**, **CUDA runs the highest precision installed** (fp32 > fp16 > int8), because the int8 LSTM nodes stay on the CPU even inside a CUDA session.
+CPU inference uses up to six threads by default, leaving additional headroom for capture, playback, and UI work; override with `BEESWAX_THREADS`. On the development laptop (i7-12700H), the int8 smoke test processed three seconds of audio in about 2.7 seconds. A busy machine can still fall behind; the stream then drops audio instead of stopping. The engine picks its model automatically: **CPU runs the int8 model**, **CUDA runs the highest precision installed** (fp32 > fp16 > int8), because the int8 LSTM nodes stay on the CPU even inside a CUDA session.
 
 ### Audio quality
 

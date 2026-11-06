@@ -4,40 +4,74 @@ pub const RATE: usize = 16_000;
 pub const HOP: usize = 128;
 pub const FFT: usize = 512;
 pub const CHUNK: usize = 640;
+const RESAMPLER_TAPS: usize = 64;
+const RESAMPLER_PHASES: usize = 4096;
 
 /// Streaming windowed-sinc resampling. Retains phase and filter history across callbacks.
 pub struct Resampler {
     samples: VecDeque<f32>,
     position: f64,
     step: f64,
-    cutoff: f64,
+    coefficients: Vec<f32>,
 }
 impl Resampler {
     pub fn new(input: u32, output: u32) -> Self {
+        let cutoff = (output as f64 / input as f64).min(1.) * 0.94;
+        let mut coefficients = Vec::with_capacity(RESAMPLER_PHASES * RESAMPLER_TAPS);
+        for phase in 0..RESAMPLER_PHASES {
+            let fraction = phase as f64 / RESAMPLER_PHASES as f64;
+            let row_start = coefficients.len();
+            let mut norm = 0.;
+            for tap in 0..RESAMPLER_TAPS {
+                let x = tap as f64 - 31. - fraction;
+                let a = std::f64::consts::PI * x * cutoff;
+                let sinc = if a.abs() < 1e-9 { 1. } else { a.sin() / a };
+                let window = 0.5 + 0.5 * (std::f64::consts::PI * x / 32.).cos();
+                let weight = sinc * window * cutoff;
+                coefficients.push(weight as f32);
+                norm += weight;
+            }
+            for weight in &mut coefficients[row_start..] {
+                *weight /= norm as f32;
+            }
+        }
         Self {
             samples: VecDeque::from(vec![0.; 32]),
             position: 32.,
             step: input as f64 / output as f64,
-            cutoff: (output as f64 / input as f64).min(1.) * 0.94,
+            coefficients,
         }
     }
     pub fn push(&mut self, input: &[f32]) -> Vec<f32> {
         self.samples.extend(input.iter().copied());
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity((input.len() as f64 / self.step).ceil() as usize);
         while self.position + 32. < self.samples.len() as f64 {
             let center = self.position.floor() as isize;
+            let phase = ((self.position - center as f64) * RESAMPLER_PHASES as f64) as usize;
+            let weights = &self.coefficients[phase * RESAMPLER_TAPS..(phase + 1) * RESAMPLER_TAPS];
+            let start = (center - 31) as usize;
+            let (front, back) = self.samples.as_slices();
+            let front_count = if start < front.len() {
+                (front.len() - start).min(RESAMPLER_TAPS)
+            } else {
+                0
+            };
+            let front_start = start.min(front.len());
+            let back_start = start.saturating_sub(front.len());
             let mut sum = 0.;
-            let mut norm = 0.;
-            for i in center - 31..=center + 32 {
-                let x = i as f64 - self.position;
-                let a = std::f64::consts::PI * x * self.cutoff;
-                let sinc = if a.abs() < 1e-9 { 1. } else { a.sin() / a };
-                let window = 0.5 + 0.5 * (std::f64::consts::PI * x / 32.).cos();
-                let w = sinc * window * self.cutoff;
-                sum += self.samples[i as usize] as f64 * w;
-                norm += w;
+            for (&sample, &weight) in front[front_start..front_start + front_count]
+                .iter()
+                .zip(&weights[..front_count])
+            {
+                sum += sample * weight;
             }
-            out.push((sum / norm) as f32);
+            for (&sample, &weight) in back[back_start..back_start + RESAMPLER_TAPS - front_count]
+                .iter()
+                .zip(&weights[front_count..])
+            {
+                sum += sample * weight;
+            }
+            out.push(sum);
             self.position += self.step;
         }
         let remove = (self.position.floor() as usize).saturating_sub(32);
@@ -196,12 +230,67 @@ mod tests {
         assert!((whole.len() as i32 - 16000).abs() < 32);
     }
     #[test]
+    fn upsampling_is_stable_across_callback_boundaries() {
+        let input: Vec<_> = (0..16000).map(|i| (i as f32 * 0.07).sin()).collect();
+        let whole = Resampler::new(16000, 48000).push(&input);
+        let mut r = Resampler::new(16000, 48000);
+        let split: Vec<_> = input.chunks(137).flat_map(|c| r.push(c)).collect();
+        assert_eq!(whole.len(), split.len());
+        let max_error = whole
+            .iter()
+            .zip(split)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0., f32::max);
+        // Re-basing the stream phase can select an adjacent polyphase table row.
+        assert!(max_error < 0.0001, "max error was {max_error}");
+        assert!((whole.len() as i32 - 48000).abs() < 100);
+    }
+    #[test]
     fn resampling_rejects_out_of_band_audio() {
         let input: Vec<_> = (0..48000)
             .map(|i| (std::f32::consts::TAU * 12000. * i as f32 / 48000.).sin())
             .collect();
         let out = Resampler::new(48000, 16000).push(&input);
         assert!(rms(&out[100..]) < 0.01);
+    }
+    #[test]
+    fn polyphase_resampling_matches_windowed_sinc_reference() {
+        let input: Vec<_> = (0..4800)
+            .map(|i| {
+                let t = i as f32 / 48000.;
+                0.2 * (std::f32::consts::TAU * 7300. * t).sin()
+                    + 0.1 * (std::f32::consts::TAU * 900. * t).sin()
+            })
+            .collect();
+        let actual = Resampler::new(48000, 16000).push(&input);
+        let mut samples = VecDeque::from(vec![0.; 32]);
+        samples.extend(input);
+        let mut position: f64 = 32.;
+        let mut expected = Vec::new();
+        let cutoff = 16000. / 48000. * 0.94;
+        while position + 32. < samples.len() as f64 {
+            let center = position.floor() as isize;
+            let mut sum = 0.;
+            let mut norm = 0.;
+            for i in center - 31..=center + 32 {
+                let x = i as f64 - position;
+                let a = std::f64::consts::PI * x * cutoff;
+                let sinc = if a.abs() < 1e-9 { 1. } else { a.sin() / a };
+                let window = 0.5 + 0.5 * (std::f64::consts::PI * x / 32.).cos();
+                let weight = sinc * window * cutoff;
+                sum += samples[i as usize] as f64 * weight;
+                norm += weight;
+            }
+            expected.push((sum / norm) as f32);
+            position += 3.;
+        }
+        assert_eq!(actual.len(), expected.len());
+        let max_error = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0., f32::max);
+        assert!(max_error < 0.0001, "max error was {max_error}");
     }
     #[test]
     fn overlap_add_restores_windowed_signal_and_gain() {
