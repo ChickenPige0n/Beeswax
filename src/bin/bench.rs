@@ -48,6 +48,13 @@ fn main() -> anyhow::Result<()> {
     let quality = measure_quality(&mut extractor, &target, &interference, &mixture)?;
     let perf = measure_pipeline(extractor, &mixture, startup_ms)?;
 
+    // Second start in the same process: filtering stopped and the user pressed
+    // Start again. Without a session cache this reloads both models.
+    let restart = Instant::now();
+    let reloaded = Extractor::new(&models, &target, Backend::Cpu)?;
+    let warm_start_ms = restart.elapsed().as_secs_f64() * 1000.;
+    drop(reloaded);
+
     println!("METRIC chunk_latency_ms={:.3}", perf.chunk_ms);
     println!("METRIC chunk_latency_median_ms={:.3}", perf.chunk_median_ms);
     println!("METRIC chunk_latency_max_ms={:.3}", perf.chunk_max_ms);
@@ -56,6 +63,7 @@ fn main() -> anyhow::Result<()> {
     println!("METRIC dsp_latency_ms={:.3}", perf.dsp_ms);
     println!("METRIC rtf={:.4}", perf.rtf);
     println!("METRIC startup_ms={:.1}", perf.startup_ms);
+    println!("METRIC warm_start_ms={:.1}", warm_start_ms);
     println!("METRIC si_sdr_improvement_db={:.3}", quality.improvement);
     println!("METRIC si_sdr_in_db={:.3}", quality.in_sdr);
     println!("METRIC si_sdr_out_db={:.3}", quality.out_sdr);
