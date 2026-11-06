@@ -28,6 +28,9 @@ const WARMUP_PASSES: usize = 1;
 const TIMED_PASSES: usize = 6;
 const COMPARE_PASSES: usize = 4;
 const MAX_LAG: isize = 1024;
+const MIX_SECONDS: usize = 3;
+const MIX_WARMUP_PASSES: usize = 1;
+const MIX_TIMED_PASSES: usize = 2;
 
 fn main() -> anyhow::Result<()> {
     raise_priority();
@@ -68,6 +71,7 @@ fn main() -> anyhow::Result<()> {
 
     let quality = measure_quality(&mut extractor, &target, &interference, &mixture)?;
     let perf = measure_pipeline(extractor, &mixture, startup_ms)?;
+    let mixed = measure_mixed(&cache, &models, &target, &mixture, backend)?;
 
     println!(
         "METRIC backend_is_cuda={}",
@@ -91,6 +95,14 @@ fn main() -> anyhow::Result<()> {
         quality.interference_suppression
     );
     println!("METRIC alignment_lag={}", quality.lag);
+    println!("METRIC mixed_cpu_ms={:.3}", mixed.cpu_ms);
+    println!("METRIC mixed_wall_ms={:.3}", mixed.wall_ms);
+    println!("METRIC mixed_si_sdr_db={:.3}", mixed.si_sdr_db);
+    println!("METRIC mixed_si_sdr_in_db={:.3}", mixed.in_sdr_db);
+    println!(
+        "METRIC mixed_improvement_db={:.3}",
+        mixed.si_sdr_db - mixed.in_sdr_db
+    );
     Ok(())
 }
 
@@ -184,16 +196,20 @@ struct Pipeline {
     extractor: Extractor,
     output: Resampler,
     pending: Vec<f32>,
+    collect: bool,
+    collected: Vec<f32>,
 }
 
 impl Pipeline {
-    fn new(extractor: Extractor) -> Self {
+    fn new(extractor: Extractor, collect: bool) -> Self {
         Self {
             input: Resampler::new(CAPTURE_RATE, RATE_U32),
             high_pass: HighPass::new(RATE as f32, 70.),
             extractor,
             output: Resampler::new(RATE_U32, CAPTURE_RATE),
             pending: Vec::with_capacity(CHUNK * 2),
+            collect,
+            collected: Vec::new(),
         }
     }
 
@@ -209,6 +225,9 @@ impl Pipeline {
             let started = Instant::now();
             let filtered = self.extractor.push(&self.pending[..CHUNK])?;
             model_ms += started.elapsed().as_secs_f64() * 1000.;
+            if self.collect {
+                self.collected.extend_from_slice(&filtered);
+            }
             self.pending.drain(..CHUNK);
             let _ = self.output.push(&filtered);
             chunks += 1;
@@ -285,7 +304,7 @@ fn measure_pipeline(
     let pass_len = capture.len() / passes;
     anyhow::ensure!(pass_len > 0, "The benchmark capture is empty");
 
-    let mut pipeline = Pipeline::new(extractor);
+    let mut pipeline = Pipeline::new(extractor, false);
     let mut measured = Vec::with_capacity(TIMED_PASSES);
     for (index, pass) in capture[..pass_len * passes].chunks(pass_len).enumerate() {
         let cpu_started = win::cpu_seconds();
@@ -338,7 +357,108 @@ fn build_capture(mixture: &[f32], passes: usize) -> Vec<f32> {
     capture
 }
 
-/// Paired thread-pool comparison: run both extractors on the same audio in the
+struct Mixed {
+    cpu_ms: f64,
+    wall_ms: f64,
+    si_sdr_db: f64,
+    in_sdr_db: f64,
+}
+
+/// A call-shaped capture: the 3 s mixture, then 3 s of digital silence.
+fn build_mixed_capture(samples: &[f32], passes: usize) -> Vec<f32> {
+    let mut upsampler = Resampler::new(RATE_U32, CAPTURE_RATE);
+    let speech = upsampler.push(samples);
+    let silence = vec![0.; MIX_SECONDS * CAPTURE_RATE as usize];
+    let mut capture = Vec::with_capacity(passes * (speech.len() + silence.len()));
+    for _ in 0..passes {
+        capture.extend_from_slice(&speech);
+        capture.extend_from_slice(&silence);
+    }
+    capture
+}
+
+fn build_mixed_reference(samples: &[f32], passes: usize) -> Vec<f32> {
+    let silence = vec![0.; MIX_SECONDS * RATE];
+    let mut reference = Vec::with_capacity(passes * (samples.len() + silence.len()));
+    for _ in 0..passes {
+        reference.extend_from_slice(samples);
+        reference.extend_from_slice(&silence);
+    }
+    reference
+}
+
+/// Half the workload is silence, so this is where a gate can save CPU that the
+/// continuous-speech benchmark cannot see. Separation is checked on the speech
+/// plus the exact-zero silence, and the DSP chain is the app's.
+fn measure_mixed(
+    cache: &ModelCache,
+    models: &Path,
+    target: &[f32],
+    mixture: &[f32],
+    backend: Backend,
+) -> anyhow::Result<Mixed> {
+    let passes = MIX_WARMUP_PASSES + MIX_TIMED_PASSES;
+    let capture = build_mixed_capture(mixture, passes);
+    let reference = build_mixed_reference(target, passes);
+    let input = build_mixed_reference(mixture, passes);
+    let pass_len = capture.len() / passes;
+    anyhow::ensure!(pass_len > 0, "The mixed capture is empty");
+    let extractor = cache.acquire(models, target, backend)?;
+    let mut pipeline = Pipeline::new(extractor, true);
+    let mut measured = Vec::with_capacity(MIX_TIMED_PASSES);
+    for (index, pass) in capture[..pass_len * passes].chunks(pass_len).enumerate() {
+        pipeline.collected.clear();
+        let cpu_started = win::cpu_seconds();
+        let started = Instant::now();
+        let mut chunks = 0usize;
+        for block in pass.chunks(CAPTURE_BLOCK) {
+            let (ran, _) = pipeline.push(block)?;
+            chunks += ran;
+        }
+        let elapsed = started.elapsed().as_secs_f64() * 1000.;
+        let cpu_ms = (win::cpu_seconds() - cpu_started) * 1000.;
+        if index < MIX_WARMUP_PASSES {
+            continue;
+        }
+        anyhow::ensure!(chunks > 0, "A mixed pass produced no 40 ms blocks");
+        let reference_start = index * 2 * MIX_SECONDS * RATE;
+        let reference_end = reference_start + 2 * MIX_SECONDS * RATE;
+        let reference = &reference[reference_start..reference_end];
+        let input = &input[reference_start..reference_end];
+        let lag = best_lag(&pipeline.collected, reference, MAX_LAG);
+        let (estimate, start) = match lag {
+            lag if lag >= 0 => (&pipeline.collected[lag as usize..], 0),
+            lag => (&pipeline.collected[..], (-lag) as usize),
+        };
+        let length = estimate.len().min(reference.len() - start);
+        let out_sdr = si_sdr(&estimate[..length], &reference[start..start + length]);
+        let in_sdr = si_sdr(
+            &input[start..start + length],
+            &reference[start..start + length],
+        );
+        measured.push((
+            cpu_ms / chunks as f64,
+            elapsed / chunks as f64,
+            out_sdr,
+            in_sdr,
+        ));
+    }
+    anyhow::ensure!(
+        measured.len() == MIX_TIMED_PASSES,
+        "Expected {MIX_TIMED_PASSES} timed mixed passes, got {}",
+        measured.len()
+    );
+    measured.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let best = measured[0];
+    Ok(Mixed {
+        cpu_ms: best.0,
+        wall_ms: best.1,
+        si_sdr_db: best.2,
+        in_sdr_db: best.3,
+    })
+}
+
+/// Paired backend comparison: run both extractors on the same audio in the
 /// same process, alternating which one goes first, and report the best pass.
 /// This removes the cross-run machine drift that makes separate runs useless
 /// for one- or two-millisecond differences.
@@ -379,8 +499,8 @@ fn compare_backends(
     let pass_len = capture.len() / passes;
     anyhow::ensure!(pass_len > 0, "The comparison capture is empty");
 
-    let mut first_pipeline = Pipeline::new(first);
-    let mut second_pipeline = Pipeline::new(second);
+    let mut first_pipeline = Pipeline::new(first, false);
+    let mut second_pipeline = Pipeline::new(second, false);
     let mut first_ms = Vec::with_capacity(COMPARE_PASSES);
     let mut second_ms = Vec::with_capacity(COMPARE_PASSES);
     for (index, pass) in capture[..pass_len * passes].chunks(pass_len).enumerate() {
@@ -440,8 +560,8 @@ fn compare_threads(
     let pass_len = capture.len() / passes;
     anyhow::ensure!(pass_len > 0, "The comparison capture is empty");
 
-    let mut first_pipeline = Pipeline::new(first);
-    let mut second_pipeline = Pipeline::new(second);
+    let mut first_pipeline = Pipeline::new(first, false);
+    let mut second_pipeline = Pipeline::new(second, false);
     let mut first_ms = Vec::with_capacity(COMPARE_PASSES);
     let mut second_ms = Vec::with_capacity(COMPARE_PASSES);
     for (index, pass) in capture[..pass_len * passes].chunks(pass_len).enumerate() {
