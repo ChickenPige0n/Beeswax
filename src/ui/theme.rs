@@ -1,4 +1,5 @@
-use gpui::{SharedString, div, prelude::*, px, rgb};
+use gpui::{Image, ImageFormat, SharedString, div, img, prelude::*, px, rgb};
+use std::sync::{Arc, LazyLock};
 
 pub const BG: u32 = 0xf4f5f0;
 pub const SURFACE: u32 = 0xfafbf7;
@@ -49,12 +50,22 @@ pub fn caption(text: impl Into<SharedString>) -> gpui::Div {
         .child(text.into())
 }
 
-pub fn section_label(text: &'static str) -> gpui::Div {
+pub fn app_icon() -> gpui::Img {
+    static ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
+        Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../../assets/icon.png").to_vec(),
+        ))
+    });
+    img(ICON.clone())
+}
+
+pub fn section_label(text: impl Into<SharedString>) -> gpui::Div {
     div()
         .text_size(px(11.))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(rgb(MUTED))
-        .child(text)
+        .child(text.into())
 }
 
 pub fn pill(text: impl Into<SharedString>, tone: PillTone) -> gpui::Div {
@@ -197,7 +208,7 @@ pub fn waveform_strip(peaks: &[f32], playing: bool) -> gpui::Div {
     row
 }
 
-pub fn metric_cell(label: &'static str, value: impl Into<SharedString>) -> gpui::Div {
+pub fn metric_cell(label: impl Into<SharedString>, value: impl Into<SharedString>) -> gpui::Div {
     div()
         .flex_1()
         .px_3()
@@ -214,7 +225,7 @@ pub fn metric_cell(label: &'static str, value: impl Into<SharedString>) -> gpui:
                 .text_size(px(10.5))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(rgb(MUTED))
-                .child(label),
+                .child(label.into()),
         )
         .child(
             div()

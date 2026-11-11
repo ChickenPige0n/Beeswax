@@ -1,5 +1,6 @@
 use crate::{
     dsp::{self, CHUNK, RATE, Resampler},
+    i18n::{Language, language, tr},
     model::Extractor,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -42,7 +43,7 @@ pub fn devices(input: bool) -> Result<Vec<Device>> {
         .filter_map(|d| {
             let id = d.id().ok()?.to_string();
             let description = d.description().ok()?;
-            let detail = description.extended().join(" · ");
+            let detail = description.extended().join(" / ");
             let name = if detail.is_empty() {
                 description.name().to_owned()
             } else {
@@ -204,7 +205,11 @@ impl Job {
             }))
             .unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
-                    "Audio worker failed. Output stopped; check the runtime and restart."
+                    "{}",
+                    tr(
+                        "Audio worker failed. Output stopped; check the runtime and restart.",
+                        "音频工作线程发生错误，输出已停止；请检查运行环境并重启。"
+                    )
                 ))
             });
             let mut s = state.lock().unwrap();
@@ -217,9 +222,13 @@ impl Job {
             if let Err(e) = result {
                 s.message = audio_error(&format!("{e:#}"));
             } else if flag.load(Ordering::Relaxed) {
-                s.message = "Stopped. Output is silent.".into();
+                s.message = tr("Stopped. Output is silent.", "已停止，输出已静音。").into();
             } else if recording {
-                s.message = "Voice enrolled. Preview the clip before filtering.".into();
+                s.message = tr(
+                    "Voice enrolled. Preview the clip before filtering.",
+                    "声纹录入完成，可在开始过滤前试听片段。",
+                )
+                .into();
             }
         });
         Self {
@@ -236,9 +245,14 @@ impl Job {
             s.active = false;
             s.previewing = false;
             s.message = match result {
-                Ok(()) if flag.load(Ordering::Relaxed) => "Preview stopped.".into(),
-                Ok(()) => "Preview finished.".into(),
-                Err(e) => format!("Could not play enrollment: {e:#}"),
+                Ok(()) if flag.load(Ordering::Relaxed) => {
+                    tr("Preview stopped.", "试听已停止。").into()
+                }
+                Ok(()) => tr("Preview finished.", "试听结束。").into(),
+                Err(e) => match language() {
+                    Language::En => format!("Could not play enrollment: {e:#}"),
+                    Language::ZhCn => format!("无法播放声纹片段：{e:#}"),
+                },
             };
         });
         Self {
@@ -372,7 +386,13 @@ fn build_input(
         cpal::SampleFormat::U16 => {
             input_stream::<u16>(device, config, producer, overruns.clone(), fault.clone())?
         }
-        other => bail!("Unsupported microphone format: {other:?}"),
+        other => bail!(
+            "{}",
+            match language() {
+                Language::En => format!("Unsupported microphone format: {other:?}"),
+                Language::ZhCn => format!("不支持的麦克风采样格式：{other:?}"),
+            }
+        ),
     };
     Ok((stream, consumer))
 }
@@ -400,7 +420,13 @@ fn build_output(
         cpal::SampleFormat::U16 => {
             output_stream::<u16>(device, config, consumer, stop, fault, misses)?
         }
-        other => bail!("Unsupported output format: {other:?}"),
+        other => bail!(
+            "{}",
+            match language() {
+                Language::En => format!("Unsupported output format: {other:?}"),
+                Language::ZhCn => format!("不支持的输出设备格式：{other:?}"),
+            }
+        ),
     };
     Ok((stream, producer))
 }
@@ -441,9 +467,12 @@ fn run_stream(
     monitor: bool,
 ) -> Result<()> {
     let host = cpal::default_host();
-    let device = host
-        .device_by_id(&input.parse()?)
-        .context("Microphone disconnected. Refresh devices.")?;
+    let device = host.device_by_id(&input.parse()?).with_context(|| {
+        tr(
+            "Microphone disconnected. Refresh devices.",
+            "麦克风已断开，请刷新设备列表。",
+        )
+    })?;
     if let Some(model) = model.as_ref() {
         let mut status = state.lock().unwrap();
         status.engine = model.engine().label().to_owned();
@@ -457,7 +486,7 @@ fn run_stream(
     }
     let supported = device
         .default_input_config()
-        .context("Cannot open the selected microphone")?;
+        .with_context(|| tr("Cannot open the selected microphone", "无法打开所选麦克风"))?;
     let rate = supported.sample_rate();
     let fault = Arc::new(AtomicBool::new(false));
     let overruns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -502,10 +531,14 @@ fn run_stream(
     let mut reserve_ms = 60u32;
     let misses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     if !recording {
-        let output_id = output.context("Choose an output device.")?;
-        let device = host
-            .device_by_id(&output_id.parse()?)
-            .context("Output device disconnected. Refresh devices.")?;
+        let output_id =
+            output.with_context(|| tr("Choose an output device.", "请选择输出设备。"))?;
+        let device = host.device_by_id(&output_id.parse()?).with_context(|| {
+            tr(
+                "Output device disconnected. Refresh devices.",
+                "输出设备已断开，请刷新设备列表。",
+            )
+        })?;
         // Any playback endpoint works: CABLE Input feeds a call app, headphones or
         // speakers let the separated voice be monitored directly.
         let supported = device.default_output_config()?;
@@ -558,11 +591,20 @@ fn run_stream(
     }
     let mut last_input = Instant::now();
     state.lock().unwrap().message = if monitor {
-        "Microphone test is active. Speak and watch the input level; nothing is recorded or played."
+        tr(
+            "Microphone test is active. Speak and watch the input level; nothing is recorded or played.",
+            "麦克风测试中。请说话并观察输入电平，音频不会被录音或外放。",
+        )
     } else if recording {
-        "Speak alone, naturally, for six seconds."
+        tr(
+            "Speak alone, naturally, for six seconds.",
+            "请独自用自然音量连续说话 6 秒。",
+        )
     } else {
-        "Filtering your voice to the selected output."
+        tr(
+            "Filtering your voice to the selected output.",
+            "正在将分离后的人声输出到所选设备。",
+        )
     }
     .into();
     let mut dropped = 0usize;
@@ -571,7 +613,11 @@ fn run_stream(
     while !stop.load(Ordering::Relaxed) {
         ensure!(
             !fault.load(Ordering::Relaxed),
-            "Audio device failed. Output stopped; refresh devices and retry."
+            "{}",
+            tr(
+                "Audio device failed. Output stopped; refresh devices and retry.",
+                "音频设备发生错误，输出已停止；请刷新设备后重试。"
+            )
         );
         // Stay close to real time: when inference or the system falls behind, discard the
         // oldest capture instead of letting an ever-growing backlog add latency.
@@ -592,7 +638,11 @@ fn run_stream(
         if n == 0 {
             ensure!(
                 last_input.elapsed() < Duration::from_secs(5),
-                "No microphone samples received for five seconds."
+                "{}",
+                tr(
+                    "No microphone samples received for five seconds.",
+                    "连续 5 秒未收到麦克风音频数据。"
+                )
             );
             thread::sleep(Duration::from_millis(2));
             continue;
@@ -636,21 +686,31 @@ fn run_stream(
                         if action == dsp::GateAction::ResumeState
                             && let Err(error) = extractor.reset_state()
                         {
-                            state.lock().unwrap().message = format!(
-                                "Could not clear the stale voice state; continuing: {error:#}"
-                            );
+                            state.lock().unwrap().message = match language() {
+                                Language::En => format!(
+                                    "Could not clear the stale voice state; continuing: {error:#}"
+                                ),
+                                Language::ZhCn => {
+                                    format!("无法重置空闲语音状态，继续运行：{error:#}")
+                                }
+                            };
                         }
                         if let Err(error) = extractor.push_into(&pending[..CHUNK], &mut filtered) {
                             // A single bad block should not end the call: drop it, keep the stream
                             // alive, and only stop when the model keeps failing.
                             failures += 1;
                             if failures >= 3 {
-                                return Err(
-                                    error.context("The voice model stopped returning audio")
-                                );
+                                return Err(error.context(tr(
+                                    "The voice model stopped returning audio",
+                                    "语音模型停止返回音频数据",
+                                )));
                             }
-                            state.lock().unwrap().message =
-                                format!("Voice model hiccup; recovering: {error:#}");
+                            state.lock().unwrap().message = match language() {
+                                Language::En => {
+                                    format!("Voice model hiccup; recovering: {error:#}")
+                                }
+                                Language::ZhCn => format!("语音模型短暂异常，正在恢复：{error:#}"),
+                            };
                             filtered.clear();
                             filtered.resize(CHUNK, 0.);
                         } else {
@@ -696,12 +756,20 @@ fn run_stream(
                 s.dropped = dropped + overruns.load(Ordering::Relaxed);
                 let engine = s.engine.clone();
                 if duration > 40. {
-                    s.message = format!(
-                        "{engine} inference needs {duration:.0} ms per 40 ms of audio. Filtering continues, but audio is dropped to stay in time."
-                    );
+                    s.message = match language() {
+                        Language::En => format!(
+                            "{engine} inference needs {duration:.0} ms per 40 ms of audio. Filtering continues, but audio is dropped to stay in time."
+                        ),
+                        Language::ZhCn => format!(
+                            "{engine} 推理每 40 ms 音频耗时 {duration:.0} ms。过滤仍在继续，但会丢弃部分音频以保持实时。"
+                        ),
+                    };
                 } else if short {
-                    s.message =
-                        "The playback queue filled up; some audio was dropped. Filtering continues.".into();
+                    s.message = tr(
+                        "The playback queue filled up; some audio was dropped. Filtering continues.",
+                        "播放缓冲队列已满，已丢弃少量音频，过滤继续运行。",
+                    )
+                    .into();
                 }
             }
         }
@@ -711,9 +779,14 @@ fn run_stream(
 
 fn audio_error(error: &str) -> String {
     if error.to_lowercase().contains("0x80070005") {
-        format!(
-            "Windows denied microphone access. Check Settings > Privacy & security > Microphone: enable microphone access and desktop app access. If already enabled, launch Beeswax directly outside the restricted session. Details: {error}"
-        )
+        match language() {
+            Language::En => format!(
+                "Windows denied microphone access. Check Settings > Privacy & security > Microphone: enable microphone access and desktop app access. If already enabled, launch Beeswax directly outside the restricted session. Details: {error}"
+            ),
+            Language::ZhCn => format!(
+                "Windows 拒绝了麦克风访问权限。请前往“设置 > 隐私和安全性 > 麦克风”，开启麦克风访问权限和桌面应用访问权限。详情：{error}"
+            ),
+        }
     } else {
         error.to_owned()
     }
@@ -723,14 +796,18 @@ fn play_preview(output: &str, sample: &[f32], stop: &Arc<AtomicBool>) -> Result<
     let host = cpal::default_host();
     let device = host
         .device_by_id(&output.parse()?)
-        .context("Preview device disconnected")?;
+        .with_context(|| tr("Preview device disconnected", "试听设备已断开连接"))?;
     ensure!(
         !device
             .description()?
             .name()
             .to_lowercase()
             .contains("cable"),
-        "Choose headphones or speakers for preview."
+        "{}",
+        tr(
+            "Choose headphones or speakers for preview.",
+            "请选择耳机或扬声器进行试听。"
+        )
     );
     let cfg = device.default_output_config()?;
     let rate = cfg.sample_rate();
@@ -757,12 +834,22 @@ fn play_preview(output: &str, sample: &[f32], stop: &Arc<AtomicBool>) -> Result<
         cpal::SampleFormat::U16 => {
             output_stream::<u16>(&device, &config, c, stop.clone(), fault.clone(), misses)?
         }
-        other => bail!("Unsupported preview format: {other:?}"),
+        other => bail!(
+            "{}",
+            match language() {
+                Language::En => format!("Unsupported preview format: {other:?}"),
+                Language::ZhCn => format!("不支持的试听格式：{other:?}"),
+            }
+        ),
     };
     stream.play()?;
     let start = Instant::now();
     while start.elapsed() < duration + Duration::from_millis(200) && !stop.load(Ordering::Relaxed) {
-        ensure!(!fault.load(Ordering::Relaxed), "Preview device failed");
+        ensure!(
+            !fault.load(Ordering::Relaxed),
+            "{}",
+            tr("Preview device failed", "试听设备发生错误")
+        );
         thread::sleep(Duration::from_millis(10));
     }
     Ok(())
@@ -773,9 +860,15 @@ mod tests {
     use super::*;
     #[test]
     fn localized_access_denied_has_actionable_guidance() {
+        crate::i18n::set_language(Language::En);
         let message = audio_error("拒绝访问。 (0x80070005)");
         assert!(message.contains("desktop app access"));
         assert!(message.contains("0x80070005"));
+        crate::i18n::set_language(Language::ZhCn);
+        let zh = audio_error("Access denied (0x80070005)");
+        assert!(zh.contains("麦克风访问权限"));
+        assert!(zh.contains("0x80070005"));
+        crate::i18n::set_language(Language::En);
         assert_eq!(audio_error("device unplugged"), "device unplugged");
     }
 }

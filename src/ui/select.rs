@@ -1,5 +1,6 @@
 use super::theme::{BORDER, BORDER_STRONG, CARD, GREEN, GREEN_SOFT, INK, MUTED};
 use super::{Beeswax, SELECT_MIC, SELECT_OUTPUT, SELECT_SPEAKER};
+use beeswax::i18n::pick;
 use gpui::{Context, KeyDownEvent, deferred, div, prelude::*, px, rgb};
 
 impl Beeswax {
@@ -17,16 +18,21 @@ impl Beeswax {
         };
         let busy = self.job.is_some();
         let open = self.open_select == Some(kind) && !busy;
+        let default_suffix = pick(self.lang, " (Default)", "（默认）");
         let label = devices
             .get(selected)
             .map(|device| {
                 format!(
                     "{}{}",
                     device.name,
-                    if device.is_default { " · Default" } else { "" }
+                    if device.is_default {
+                        default_suffix
+                    } else {
+                        ""
+                    }
                 )
             })
-            .unwrap_or_else(|| "No device available".into());
+            .unwrap_or_else(|| pick(self.lang, "No device available", "无可用设备").into());
 
         let options = devices
             .iter()
@@ -36,7 +42,11 @@ impl Beeswax {
                 let text = format!(
                     "{}{}",
                     device.name,
-                    if device.is_default { " · Default" } else { "" }
+                    if device.is_default {
+                        default_suffix
+                    } else {
+                        ""
+                    }
                 );
                 div()
                     .id(("device-option", kind as usize * 1000 + index))

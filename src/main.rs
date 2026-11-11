@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod model_download;
 mod profile;
 mod ui;
@@ -6,6 +8,7 @@ mod updates;
 use beeswax::{
     Backend,
     audio::{self, Job, Status},
+    i18n::{self, Language, tr},
     model::{self, Extractor},
 };
 use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px};
@@ -36,6 +39,29 @@ fn main() -> anyhow::Result<()> {
     let data_dir = std::env::var_os("BEESWAX_DATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("data"));
+    let cli_mode = std::env::args().any(|a| {
+        matches!(
+            a.as_str(),
+            "--devices" | "--test-mic" | "--providers" | "--self-test" | "--help" | "-h"
+        )
+    });
+    if cli_mode {
+        attach_parent_console();
+    }
+    let lang = cli_language()
+        .or_else(|| profile::load_language(&data_dir))
+        .unwrap_or_else(Language::detect);
+    i18n::set_language(lang);
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!("Beeswax v{}", env!("CARGO_PKG_VERSION"));
+        println!("  --devices        List audio input and output endpoints");
+        println!("  --test-mic       Monitor the default microphone for 3 seconds");
+        println!("  --providers      Show ONNX Runtime DLL and execution providers");
+        println!("  --self-test      Run offline enrollment + streaming smoke test");
+        println!("  --cuda           Request CUDA during --self-test");
+        println!("  --lang <en|zh>   Override UI language");
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--devices") {
         for input in [true, false] {
             for device in audio::devices(input)? {
@@ -82,7 +108,11 @@ fn main() -> anyhow::Result<()> {
     let runtime_error = std::panic::catch_unwind(|| beeswax::runtime::initialize(&root))
         .unwrap_or_else(|_| {
             Err(anyhow::anyhow!(
-                "ONNX Runtime could not initialize. Reinstall Beeswax, or set ORT_DYLIB_PATH to an ONNX Runtime 1.22+ DLL for this architecture."
+                "{}",
+                tr(
+                    "ONNX Runtime could not initialize. Reinstall Beeswax, or set ORT_DYLIB_PATH to an ONNX Runtime 1.22+ DLL for this architecture.",
+                    "无法初始化 ONNX Runtime。请重新安装 Beeswax，或将 ORT_DYLIB_PATH 指向当前架构的 ONNX Runtime 1.22+ DLL。"
+                )
             ))
         })
         .err()
@@ -180,7 +210,14 @@ fn main() -> anyhow::Result<()> {
             },
             |_, cx| {
                 cx.new(|cx| {
-                    ui::Beeswax::new(model_dir, data_dir, runtime_error, update_repository, cx)
+                    ui::Beeswax::new(
+                        model_dir,
+                        data_dir,
+                        runtime_error,
+                        update_repository,
+                        lang,
+                        cx,
+                    )
                 })
             },
         )
@@ -188,4 +225,37 @@ fn main() -> anyhow::Result<()> {
         cx.activate(true);
     });
     Ok(())
+}
+
+fn cli_language() -> Option<Language> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--lang" {
+            return args.next().and_then(|v| Language::from_code(&v));
+        }
+        if let Some(value) = arg.strip_prefix("--lang=") {
+            return Language::from_code(value);
+        }
+    }
+    None
+}
+
+fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
+        }
+        // When launched via redirected pipes (CI, Cargo, PowerShell capture), stdout
+        // already has a valid handle and attaching would override the pipe.
+        let has_stdout = !std::io::stdout().as_raw_handle().is_null();
+        if !has_stdout {
+            unsafe {
+                let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        }
+    }
 }

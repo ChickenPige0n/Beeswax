@@ -154,7 +154,13 @@ fn apply_backend(
             }
             #[cfg(not(feature = "cuda"))]
             {
-                anyhow::bail!("CUDA support is not included in this build.");
+                anyhow::bail!(
+                    "{}",
+                    crate::i18n::tr(
+                        "CUDA support is not included in this build.",
+                        "当前构建未包含 CUDA 支持。"
+                    )
+                );
             }
         }
     }
@@ -198,12 +204,14 @@ fn open_chunk_session(
 }
 
 fn model_load_context(path: &Path) -> String {
-    format!(
-        "Could not load {}",
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
-    )
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    match crate::i18n::language() {
+        crate::i18n::Language::En => format!("Could not load {file}"),
+        crate::i18n::Language::ZhCn => format!("无法加载模型文件 {file}"),
+    }
 }
 
 fn first_line(error: &anyhow::Error) -> String {
@@ -558,15 +566,27 @@ impl Extractor {
                     mag_frames,
                     ctx_frames,
                 )
-                .context("The CPU fallback could not load the voice model")?;
+                .with_context(|| {
+                    crate::i18n::tr(
+                        "The CPU fallback could not load the voice model",
+                        "CPU 回退模式无法加载语音模型",
+                    )
+                })?;
+                let reason = first_line(&error);
                 return Self::finish(
                     session,
                     Backend::Cpu,
                     cpu_name,
-                    Some(format!(
-                        "CUDA could not start ({}). Filtering with the CPU instead.",
-                        first_line(&error)
-                    )),
+                    Some(match crate::i18n::language() {
+                        crate::i18n::Language::En => {
+                            format!(
+                                "CUDA could not start ({reason}). Filtering with the CPU instead."
+                            )
+                        }
+                        crate::i18n::Language::ZhCn => {
+                            format!("CUDA 无法启动（{reason}），已自动切换为 CPU 过滤。")
+                        }
+                    }),
                     cpu_specialized,
                     mag_shape,
                     mag_values,
@@ -603,7 +623,11 @@ impl Extractor {
     ) -> Result<Self> {
         ensure!(
             specialized || session.inputs.iter().any(|i| i.name == "context"),
-            "Expected the VoxLock 1.1 ONNX interface used by the 1.1.1 reference (context input)."
+            "{}",
+            crate::i18n::tr(
+                "Expected the VoxLock 1.1 ONNX interface used by the 1.1.1 reference (context input).",
+                "模型接口不匹配：需要 VoxLock 1.1 ONNX 接口（包含 context 输入）。"
+            )
         );
         let allocator = Allocator::default();
         let run_options = RunOptions::new()?.with_outputs(
@@ -732,7 +756,11 @@ impl Extractor {
             ensure!(
                 all_frames.len() == BLOCK_FRAMES * FFT
                     && all_frames[..count * FFT].iter().all(|x| x.is_finite()),
-                "Invalid model output; microphone stopped."
+                "{}",
+                crate::i18n::tr(
+                    "Invalid model output; microphone stopped.",
+                    "模型输出异常，已停止音频输出。"
+                )
             );
             self.ola
                 .push_into(&all_frames[..count * FFT], &mut self.skip, result);

@@ -57,7 +57,11 @@ pub fn initialize(root: &Path) -> anyhow::Result<()> {
     let path = runtime_dll(root);
     anyhow::ensure!(
         path.is_file(),
-        "ONNX Runtime (onnxruntime.dll) is missing. Reinstall Beeswax from the Windows release package, or set ORT_DYLIB_PATH to an ONNX Runtime 1.22+ DLL."
+        "{}",
+        crate::i18n::tr(
+            "ONNX Runtime (onnxruntime.dll) is missing. Reinstall Beeswax from the Windows release package, or set ORT_DYLIB_PATH to an ONNX Runtime 1.22+ DLL.",
+            "缺少 ONNX Runtime (onnxruntime.dll)。请从 Windows 发行包重新安装 Beeswax，或将 ORT_DYLIB_PATH 指向 ONNX Runtime 1.22+ DLL。"
+        )
     );
     // The CUDA provider DLL is loaded by onnxruntime.dll itself; its cublas/cuDNN
     // dependencies must already be resolvable. Put the directory first on PATH so the
@@ -87,6 +91,10 @@ pub fn initialize(root: &Path) -> anyhow::Result<()> {
 #[cfg(not(feature = "inference"))]
 pub fn initialize(_: &Path) -> anyhow::Result<()> {
     anyhow::bail!(
-        "Enrollment/UI development build. Rebuild with default features to enable filtering."
+        "{}",
+        crate::i18n::tr(
+            "Enrollment/UI development build. Rebuild with default features to enable filtering.",
+            "当前为声纹/界面开发构建，请使用默认特性重新编译以启用人声过滤。"
+        )
     )
 }

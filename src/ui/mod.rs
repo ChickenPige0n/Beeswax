@@ -6,9 +6,10 @@ use crate::{model_download, profile, updates};
 use beeswax::{
     Backend,
     audio::{self, Device, Job, Status},
+    i18n::{self, Language, pick},
     model,
 };
-use gpui::{Context, FocusHandle, MouseButton, Window, div, prelude::*, px, rgb};
+use gpui::{Context, FocusHandle, FontFallbacks, MouseButton, Window, div, prelude::*, px, rgb};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -44,6 +45,7 @@ pub struct Beeswax {
     pub(super) data_dir: PathBuf,
     pub(super) runtime_error: Option<String>,
     pub(super) backend: Backend,
+    pub(super) lang: Language,
     pub(super) cuda: bool,
     pub(super) providers: String,
     pub(super) models: String,
@@ -57,28 +59,15 @@ impl Beeswax {
         data_dir: PathBuf,
         runtime_error: Option<String>,
         update_repository: Option<String>,
+        lang: Language,
         cx: &mut Context<Self>,
     ) -> Self {
+        i18n::set_language(lang);
         let voice = profile::load(&data_dir);
-        let message = match &voice {
-            Ok(_) => "Voice profile loaded. Ready to filter.".to_owned(),
-            Err(_) if !data_dir.join("voice.json").exists() => {
-                "Record a 6-second voice sample to get started.".to_owned()
-            }
-            Err(e) => format!("Saved enrollment could not be loaded: {e}. Record again."),
-        };
+        let message = Self::startup_message(lang, &data_dir, &voice);
         let cuda = runtime_error.is_none() && model::cuda_available();
-        let models = format_models(&model_dir);
-        let providers = if runtime_error.is_none() {
-            let names = model::providers();
-            if names.is_empty() {
-                "none".to_owned()
-            } else {
-                names.join(", ")
-            }
-        } else {
-            "unavailable".to_owned()
-        };
+        let models = format_models(&model_dir, lang);
+        let providers = format_providers(runtime_error.is_none(), lang);
         let backend = match profile::load_backend(&data_dir) {
             Some(Backend::Cuda) if cuda => Backend::Cuda,
             _ => Backend::Cpu,
@@ -109,6 +98,7 @@ impl Beeswax {
             data_dir,
             runtime_error,
             backend,
+            lang,
             cuda,
             providers,
             models,
@@ -128,8 +118,8 @@ impl Beeswax {
                 if view
                     .update(cx, |this, cx| {
                         let mut changed = false;
-                        if this.models == "none" && this.model_setup.lock().unwrap().ready {
-                            let updated = format_models(&this.model_dir);
+                        if this.model_setup.lock().unwrap().ready {
+                            let updated = format_models(&this.model_dir, this.lang);
                             if updated != this.models {
                                 this.models = updated;
                                 changed = true;
@@ -140,9 +130,14 @@ impl Beeswax {
                             let sample = this.status.lock().unwrap().enrollment.take();
                             if let Some(sample) = sample {
                                 if let Err(e) = profile::save(&this.data_dir, &sample) {
-                                    this.status.lock().unwrap().message = format!(
-                                        "Enrolled for this session, but could not save: {e}"
-                                    );
+                                    this.status.lock().unwrap().message = match this.lang {
+                                        Language::En => format!(
+                                            "Enrolled for this session, but could not save: {e}"
+                                        ),
+                                        Language::ZhCn => {
+                                            format!("本次会话声纹已录入，但保存失败：{e}")
+                                        }
+                                    };
                                 }
                                 this.waveform = waveform_peaks(&sample);
                                 this.voice = Some(sample);
@@ -163,6 +158,60 @@ impl Beeswax {
         })
         .detach();
         app
+    }
+
+    fn startup_message(
+        lang: Language,
+        data_dir: &std::path::Path,
+        voice: &anyhow::Result<Vec<f32>>,
+    ) -> String {
+        match voice {
+            Ok(_) => pick(
+                lang,
+                "Voice profile loaded. Ready to filter.",
+                "已加载声纹配置，随时可开始过滤。",
+            )
+            .to_owned(),
+            Err(_) if !data_dir.join("voice.json").exists() => pick(
+                lang,
+                "Record a 6-second voice sample to get started.",
+                "请先录制一段 6 秒的个人语音以开始使用。",
+            )
+            .to_owned(),
+            Err(e) => match lang {
+                Language::En => format!("Saved enrollment could not be loaded: {e}. Record again."),
+                Language::ZhCn => format!("无法加载已保存的声纹：{e}。请重新录制。"),
+            },
+        }
+    }
+
+    pub(super) fn choose_language(&mut self, lang: Language) {
+        if self.lang == lang {
+            return;
+        }
+        self.lang = lang;
+        i18n::set_language(lang);
+        profile::save_language(&self.data_dir, lang);
+        self.models = format_models(&self.model_dir, lang);
+        self.providers = format_providers(self.runtime_error.is_none(), lang);
+        if self.job.is_none() && self.runtime_error.is_none() {
+            let voice = profile::load(&self.data_dir);
+            self.status.lock().unwrap().message =
+                Self::startup_message(lang, &self.data_dir, &voice);
+        }
+        let mut update = self.update_state.lock().unwrap();
+        if let Some((version, _)) = update.available.clone() {
+            update.message = Some(match lang {
+                Language::En => format!("Beeswax {version} is available"),
+                Language::ZhCn => format!("发现新版本 Beeswax {version}"),
+            });
+        } else if update.message.is_some() {
+            let ver = env!("CARGO_PKG_VERSION");
+            update.message = Some(match lang {
+                Language::En => format!("Beeswax {ver} is up to date"),
+                Language::ZhCn => format!("当前已是最新版本 Beeswax {ver}"),
+            });
+        }
     }
 
     pub(super) fn refresh(&mut self) {
@@ -209,7 +258,10 @@ impl Beeswax {
                     .unwrap_or(0);
             }
             (Err(e), _) | (_, Err(e)) => {
-                self.status.lock().unwrap().message = format!("Cannot enumerate audio devices: {e}")
+                self.status.lock().unwrap().message = match self.lang {
+                    Language::En => format!("Cannot enumerate audio devices: {e}"),
+                    Language::ZhCn => format!("无法枚举音频设备：{e}"),
+                }
             }
         }
     }
@@ -219,12 +271,21 @@ impl Beeswax {
             return;
         }
         if !record && !self.model_setup.lock().unwrap().ready {
-            self.status.lock().unwrap().message = "Required voice models are not ready yet.".into();
+            self.status.lock().unwrap().message = pick(
+                self.lang,
+                "Required voice models are not ready yet.",
+                "所需的语音模型尚未就绪。",
+            )
+            .into();
             return;
         }
         let Some(input) = self.inputs.get(self.input) else {
-            self.status.lock().unwrap().message =
-                "Connect a physical microphone, then refresh devices.".into();
+            self.status.lock().unwrap().message = pick(
+                self.lang,
+                "Connect a physical microphone, then refresh devices.",
+                "请连接物理麦克风后刷新设备列表。",
+            )
+            .into();
             return;
         };
         if !record {
@@ -233,12 +294,17 @@ impl Beeswax {
                 return;
             }
             if self.voice.is_none() {
-                self.status.lock().unwrap().message = "Record your voice first.".into();
+                self.status.lock().unwrap().message =
+                    pick(self.lang, "Record your voice first.", "请先录制个人声纹。").into();
                 return;
             }
             if self.outputs.is_empty() {
-                self.status.lock().unwrap().message =
-                    "Connect headphones, speakers or VB-CABLE, then refresh devices.".into();
+                self.status.lock().unwrap().message = pick(
+                    self.lang,
+                    "Connect headphones, speakers or VB-CABLE, then refresh devices.",
+                    "请连接耳机、扬声器或安装 VB-CABLE 后刷新设备列表。",
+                )
+                .into();
                 return;
             }
         }
@@ -247,11 +313,23 @@ impl Beeswax {
             recording: record && !monitor,
             monitoring: monitor,
             message: if monitor {
-                "Opening microphone for level check…"
+                pick(
+                    self.lang,
+                    "Opening microphone for level check…",
+                    "正在打开麦克风进行音量测试…",
+                )
             } else if record {
-                "Opening microphone for enrollment…"
+                pick(
+                    self.lang,
+                    "Opening microphone for enrollment…",
+                    "正在打开麦克风准备录入声纹…",
+                )
             } else {
-                "Preparing voice separator…"
+                pick(
+                    self.lang,
+                    "Preparing voice separator…",
+                    "正在准备人声分离引擎…",
+                )
             }
             .into(),
             ..Default::default()
@@ -281,14 +359,21 @@ impl Beeswax {
             return;
         };
         let Some(device) = self.speakers.get(self.speaker) else {
-            self.status.lock().unwrap().message =
-                "Connect headphones or speakers, then refresh devices.".into();
+            self.status.lock().unwrap().message = pick(
+                self.lang,
+                "Connect headphones or speakers, then refresh devices.",
+                "请连接耳机或扬声器后刷新设备列表。",
+            )
+            .into();
             return;
         };
         *self.status.lock().unwrap() = Status {
             active: true,
             previewing: true,
-            message: format!("Playing enrollment clip on {}", device.name),
+            message: match self.lang {
+                Language::En => format!("Playing enrollment clip on {}", device.name),
+                Language::ZhCn => format!("正在通过 {} 试听声纹片段", device.name),
+            },
             ..Default::default()
         };
         self.open_select = None;
@@ -305,10 +390,14 @@ impl Beeswax {
                 self.waveform.clear();
                 self.show_preview_picker = false;
                 self.cache.clear();
-                self.status.lock().unwrap().message = "Voice profile removed.".into();
+                self.status.lock().unwrap().message =
+                    pick(self.lang, "Voice profile removed.", "已清除声纹配置。").into();
             }
             Err(e) => {
-                self.status.lock().unwrap().message = format!("Could not delete profile: {e}");
+                self.status.lock().unwrap().message = match self.lang {
+                    Language::En => format!("Could not delete profile: {e}"),
+                    Language::ZhCn => format!("无法删除声纹配置：{e}"),
+                };
             }
         }
     }
@@ -316,7 +405,7 @@ impl Beeswax {
     pub(super) fn stop(&mut self) {
         if let Some(job) = &self.job {
             job.cancel();
-            self.status.lock().unwrap().message = "Stopping…".into();
+            self.status.lock().unwrap().message = pick(self.lang, "Stopping…", "正在停止…").into();
         }
     }
 
@@ -348,15 +437,24 @@ impl Render for Beeswax {
         let output_select = self.device_select(SELECT_OUTPUT, cx);
         let speaker_select = self.device_select(SELECT_SPEAKER, cx);
 
-        div()
+        let mut root = div()
             .id("app")
             .size_full()
             .bg(rgb(BG))
             .text_color(rgb(INK))
-            .font_family("Segoe UI")
+            .font_family(if self.lang.is_zh() {
+                "Microsoft YaHei UI"
+            } else {
+                "Segoe UI"
+            })
             .flex()
-            .flex_col()
-            .child(self.render_header(&state, &update_state, busy, cx))
+            .flex_col();
+        root.style().text.font_fallbacks = Some(FontFallbacks::from_fonts(vec![
+            "Segoe UI".to_owned(),
+            "Microsoft YaHei UI".to_owned(),
+            "Microsoft YaHei".to_owned(),
+        ]));
+        root.child(self.render_header(&state, &update_state, busy, cx))
             .child(
                 div().id("main-scroll").flex_1().overflow_y_scroll().child(
                     div()
@@ -408,12 +506,25 @@ impl Render for Beeswax {
     }
 }
 
-fn format_models(folder: &std::path::Path) -> String {
+fn format_models(folder: &std::path::Path, lang: Language) -> String {
     let list = model::installed_models(folder);
     if list.is_empty() {
-        "none".to_owned()
+        pick(lang, "none", "无").to_owned()
     } else {
         list.join(", ")
+    }
+}
+
+fn format_providers(runtime_ok: bool, lang: Language) -> String {
+    if runtime_ok {
+        let names = model::providers();
+        if names.is_empty() {
+            pick(lang, "none", "无").to_owned()
+        } else {
+            names.join(", ")
+        }
+    } else {
+        pick(lang, "unavailable", "不可用").to_owned()
     }
 }
 

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use beeswax::i18n::{Language, language, tr};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -78,7 +79,13 @@ pub fn start(folder: PathBuf, state: Arc<Mutex<State>>) {
         current.active = true;
         current.ready = false;
         current.error = None;
-        current.message = Some("Preparing required voice models…".to_owned());
+        current.message = Some(
+            tr(
+                "Preparing required voice models…",
+                "正在准备所需的语音模型…",
+            )
+            .to_owned(),
+        );
     }
 
     thread::spawn(move || {
@@ -88,19 +95,28 @@ pub fn start(folder: PathBuf, state: Arc<Mutex<State>>) {
                 .iter()
                 .find(|model| model.name.as_str() == file)
                 .map_or(0, |model| model.bytes);
-            state.lock().unwrap().message = Some(format!(
-                "Downloading voice model {index}/{}: {file} · {:.1} / {:.1} MB",
-                models.len(),
-                bytes as f64 / 1_000_000.,
-                total as f64 / 1_000_000.
-            ));
+            let mb = bytes as f64 / 1_000_000.;
+            let total_mb = total as f64 / 1_000_000.;
+            let count = models.len();
+            state.lock().unwrap().message = Some(match language() {
+                Language::En => {
+                    format!(
+                        "Downloading voice model {index}/{count}: {file} ({mb:.1} / {total_mb:.1} MB)"
+                    )
+                }
+                Language::ZhCn => {
+                    format!(
+                        "正在下载语音模型 {index}/{count}：{file}（{mb:.1} / {total_mb:.1} MB）"
+                    )
+                }
+            });
         });
         let mut current = state.lock().unwrap();
         current.active = false;
         current.ready = result.is_ok() && required_models_present(&folder);
         current.error = result.err().map(|error| format!("{error:#}"));
         current.message = if current.ready {
-            Some("Required voice models are ready.".to_owned())
+            Some(tr("Required voice models are ready.", "所需的语音模型已就绪。").to_owned())
         } else {
             None
         };
@@ -108,7 +124,12 @@ pub fn start(folder: PathBuf, state: Arc<Mutex<State>>) {
 }
 
 fn download_required(folder: &Path, mut progress: impl FnMut(usize, &str, u64)) -> Result<()> {
-    std::fs::create_dir_all(folder).context("Could not create the models directory")?;
+    std::fs::create_dir_all(folder).with_context(|| {
+        tr(
+            "Could not create the models directory",
+            "无法创建 models 目录",
+        )
+    })?;
     let manifest = manifest();
     for (index, model) in manifest.models.iter().enumerate() {
         let destination = folder.join(&model.name);
@@ -129,7 +150,11 @@ fn download_required(folder: &Path, mut progress: impl FnMut(usize, &str, u64)) 
     }
     ensure!(
         required_models_present(folder),
-        "The downloaded VoxLock files are incomplete. Retry the download."
+        "{}",
+        tr(
+            "The downloaded VoxLock files are incomplete. Retry the download.",
+            "下载的 VoxLock 模型文件不完整，请重试下载。"
+        )
     );
     Ok(())
 }
@@ -143,24 +168,34 @@ fn download_file(
 ) -> Result<()> {
     let partial = destination.with_extension("onnx.download");
     let _ = std::fs::remove_file(&partial);
-    let mut child = Command::new(curl_program())
-        .args([
-            "--location",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--retry",
-            "2",
-            "--connect-timeout",
-            "20",
-            "--output",
-        ])
-        .arg(&partial)
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Could not start curl to download the voice models")?;
+    let mut cmd = Command::new(curl_program());
+    cmd.args([
+        "--location",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--retry",
+        "2",
+        "--connect-timeout",
+        "20",
+        "--output",
+    ])
+    .arg(&partial)
+    .arg(url)
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().with_context(|| {
+        tr(
+            "Could not start curl to download the voice models",
+            "无法启动 curl 下载语音模型",
+        )
+    })?;
 
     loop {
         if child.try_wait()?.is_some() {
@@ -175,37 +210,70 @@ fn download_file(
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let _ = std::fs::remove_file(&partial);
         bail!(
-            "Model download failed{}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
+            "{}",
+            match (language(), detail.is_empty()) {
+                (Language::En, true) => "Model download failed".to_owned(),
+                (Language::En, false) => format!("Model download failed: {detail}"),
+                (Language::ZhCn, true) => "模型下载失败".to_owned(),
+                (Language::ZhCn, false) => format!("模型下载失败：{detail}"),
             }
         );
     }
 
     let length = partial
         .metadata()
-        .context("Downloaded model file is missing")?
+        .with_context(|| tr("Downloaded model file is missing", "已下载的模型文件不存在"))?
         .len();
     ensure!(
         length == expected_bytes,
-        "Downloaded model file has the wrong size ({length} bytes, expected {expected_bytes})"
+        "{}",
+        match language() {
+            Language::En => format!(
+                "Downloaded model file has the wrong size ({length} bytes, expected {expected_bytes})"
+            ),
+            Language::ZhCn => {
+                format!(
+                    "已下载的模型文件大小不正确（实际 {length} 字节，预期 {expected_bytes} 字节）"
+                )
+            }
+        }
     );
     let actual_sha256 = sha256_file(&partial)?;
     if actual_sha256 != expected_sha256 {
         let _ = std::fs::remove_file(&partial);
-        bail!("SHA-256 verification failed for {}", destination.display());
+        let display = destination.display();
+        bail!(
+            "{}",
+            match language() {
+                Language::En => format!("SHA-256 verification failed for {display}"),
+                Language::ZhCn => format!("{display} 的 SHA-256 校验失败"),
+            }
+        );
     }
     if destination.exists() {
-        std::fs::remove_file(destination).context("Could not replace the incomplete model file")?;
+        std::fs::remove_file(destination).with_context(|| {
+            tr(
+                "Could not replace the incomplete model file",
+                "无法替换未完成的模型文件",
+            )
+        })?;
     }
-    std::fs::rename(&partial, destination).context("Could not install the downloaded model")?;
+    std::fs::rename(&partial, destination).with_context(|| {
+        tr(
+            "Could not install the downloaded model",
+            "无法安装已下载的模型",
+        )
+    })?;
     Ok(())
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).context("Could not read the downloaded model")?;
+    let mut file = File::open(path).with_context(|| {
+        tr(
+            "Could not read the downloaded model",
+            "无法读取已下载的模型文件",
+        )
+    })?;
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {

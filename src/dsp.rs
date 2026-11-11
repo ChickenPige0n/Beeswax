@@ -271,11 +271,14 @@ impl Gate {
 pub fn enrollment(x: &[f32]) -> anyhow::Result<Vec<f32>> {
     anyhow::ensure!(
         x.len() >= 3 * RATE,
-        "Record at least three seconds of speech."
+        crate::i18n::tr(
+            "Record at least three seconds of speech.",
+            "请录制至少 3 秒的清晰语音。"
+        )
     );
     anyhow::ensure!(
         x.iter().all(|v| v.is_finite()),
-        "Invalid microphone samples."
+        crate::i18n::tr("Invalid microphone samples.", "麦克风采样数据无效。")
     );
     let size = 3 * RATE;
     let mut energy: f64 = x[..size].iter().map(|v| (*v as f64).powi(2)).sum();
@@ -289,11 +292,17 @@ pub fn enrollment(x: &[f32]) -> anyhow::Result<Vec<f32>> {
     let sample = x[best.1..best.1 + size].to_vec();
     anyhow::ensure!(
         rms(&sample) > 0.003,
-        "Recording is too quiet. Move closer and record again."
+        crate::i18n::tr(
+            "Recording is too quiet. Move closer and record again.",
+            "录音音量过小，请靠近麦克风后重新录制。"
+        )
     );
     anyhow::ensure!(
         sample.iter().filter(|v| v.abs() >= 0.99).count() < size / 100,
-        "Recording is clipping. Lower the microphone level and record again."
+        crate::i18n::tr(
+            "Recording is clipping. Lower the microphone level and record again.",
+            "录音出现削波失真，请调低麦克风增益后重新录制。"
+        )
     );
     Ok(sample)
 }

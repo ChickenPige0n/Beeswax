@@ -1,176 +1,66 @@
 # Beeswax
 
-A Windows target-speaker virtual microphone built with **gpui-fast**, Rust **ort**, the **VoxLock 1.1.1** streaming implementation and its pinned ONNX model revision, and **VB-CABLE**. A light native interface records enrollment, selects audio endpoints, and starts/stops voice filtering. Release archives bundle ONNX Runtime and the required models, so a fresh install filters without a setup script or a first-launch model download. Source builds use `python scripts/vendor.py` to fetch the same files once.
+<p align="center">
+  <img src="assets/icon.png" width="88" alt="Beeswax icon" />
+</p>
 
-After building, launch `target/release/beeswax.exe`.
+<p align="center">
+  <strong>Local target-speaker virtual microphone for Windows</strong><br/>
+  Keep only <em>your</em> voice on calls and recordings — 100% offline, with no cloud uploads.
+</p>
+<p align="center">
+  <img src="assets/screenshot.png" width="48%" alt="Beeswax English UI" />
+  <img src="assets/screenshot-zh.png" width="48%" alt="Beeswax Chinese UI" />
+</p>
 
-## Build and run
+---
 
-Requires Windows x64, Rust/MSVC with the Windows SDK, Python 3.9+ for the vendoring helper, and VB-CABLE installed. From the project directory:
+## What It Does
 
-```powershell
-python scripts/vendor.py
-cargo build --release --locked
-.\target\release\beeswax.exe
-```
+Beeswax listens to your physical microphone, isolates **your enrolled voice** in real time, and sends the clean audio to a virtual microphone (such as **VB-CABLE**) or directly to your headphones.
 
-`scripts/vendor.py` installs the pinned ONNX Runtime 1.30 CPU DLL and the two VoxLock models:
+- **Isolates your voice**: Suppresses background chatter, roommates, TV audio, and room noise.
+- **100% private & offline**: Runs locally on your PC. Your voice profile and microphone audio never leave your machine.
+- **Ready out of the box**: Release downloads include ONNX Runtime and the voice models — just unzip and run `beeswax.exe`.
+- **Bilingual UI**: Built-in **English** and **Simplified Chinese (`中文`)** interface with one-click switching.
 
-```
-runtime/onnxruntime.dll
-models/enroll.onnx
-models/chunk_int8.onnx
-```
+---
 
-Model hashes, sizes and the upstream revision live in `models.json`; every download is checked against them. Re-running the script is cheap and only downloads what is missing. `python scripts/vendor.py check` verifies without downloading, and `python scripts/vendor.py package` builds the release ZIP.
+## Quick Start
 
-Release CI restores `runtime/` and `models/` from an `actions/cache` entry keyed by `models.json` and `scripts/vendor.py`. A cache miss downloads and verifies the files; only verified files are packaged. No PowerShell setup scripts are shipped.
+1. **Install VB-CABLE (optional, for call apps)**  
+   Download and install [VB-CABLE](https://vb-audio.com/Cable/) if you want to use Beeswax as a microphone inside Discord, Zoom, Teams, Tencent Meeting, OBS, or games. *(Skip this if you only want to listen through headphones.)*
 
-The release ZIP is self-contained:
+2. **Download & Launch**  
+   Download `beeswax-windows-x64.zip` from [Releases](https://github.com/ChickenPige0n/Beeswax/releases/latest), extract the folder anywhere, and open **`beeswax.exe`**.
 
-```
-beeswax.exe
-runtime/onnxruntime.dll
-models/enroll.onnx
-models/chunk_int8.onnx
-models.json
-README.md
-LICENSE
-```
+3. **Record Your Voice (6 seconds)**  
+   Under **Target Voice Profile**, click **Record voice** and speak naturally by yourself for 6 seconds. Beeswax automatically keeps the clearest 3-second clip. Click **Play clip** to preview it.
 
-Use `ORT_DYLIB_PATH` to point at a different ONNX Runtime DLL, or `BEESWAX_MODELS` to use another models folder. The Rust binding is pinned to `ort 2.0.0-rc.10`; use an ONNX Runtime supporting API 22 or newer.
+4. **Choose Audio Devices**  
+   Under **Audio Routing**, pick your **Physical microphone** on the left and **`CABLE Input (VB-Audio Virtual Cable)`** on the right (or choose headphones to monitor directly). Use **Test mic** to verify your input level.
 
-The default build registers the CUDA execution provider and lets **Inference Engine** choose between **CPU** and **CUDA**; CPU is preselected, and the choice is remembered. CUDA remains the better choice when the host CPU is busy elsewhere: it keeps the int8 LSTM on the GPU and leaves the CPU to the game. On the development laptop, however, CPU int8 is slightly faster than CUDA fp32, separates slightly better, and is the backend the session cache can reuse, so it is the default. CUDA is selectable only when the chosen ONNX Runtime DLL advertises `CUDAExecutionProvider`. **CUDA is NVIDIA-only**: an Intel or AMD integrated GPU cannot run it, no matter which DLL is installed. If a CUDA session cannot start, Beeswax falls back to CPU and shows the reason in the Inference Engine panel. Build without CUDA registration with `cargo build --release --no-default-features --features inference`; the choice is remembered in `data/settings.json`.
+5. **Start Filtering**  
+   Click **Start filtering**, then set your microphone in Discord, Zoom, Teams, or OBS to **`CABLE Output (VB-Audio Virtual Cable)`**.
 
-Beeswax reads `https://github.com/owner/repo/releases/latest` at startup and compares the redirected tag with the running version using SemVer. This is the public releases page, not the REST API, so it is not subject to the unauthenticated API's hourly rate limit (the cause of the previous HTTP 403 update failures) and needs no token. CI builds embed the GitHub repository automatically; local builds discover it from `remote.origin.url` or accept `BEESWAX_GITHUB_REPOSITORY=owner/repo`. Tag a version such as `v0.3.0` to publish a Windows x64 release archive.
+---
 
-### Enabling CUDA (optional)
+## Tips & Troubleshooting
 
-The vendored runtime is the CPU build, so `--providers` reports only `CPU` and the Inference Engine panel keeps CUDA disabled. A GPU and a display driver are not enough: the CPU runtime has no CUDA provider. Check what is installed:
+- **Microphone meter is not moving**: Click **Test mic**. If Windows denies access (`0x80070005`), click **Windows mic privacy ↗** in the Audio Routing card and make sure both *Microphone access* and *Let desktop apps access your microphone* are enabled.
+- **Echo or feedback**: Only select headphones (never open speakers) when monitoring directly, and keep Windows *"Listen to this device"* turned off.
+- **Best sound quality**: Speak at your normal call distance when recording your profile, and disable built-in Windows microphone "Audio Enhancements" if your voice sounds over-processed.
 
-```powershell
-.\target\release\beeswax.exe --providers
-# runtime dll: ...\runtime\onnxruntime.dll
-# providers: CPU
-# cuda available: false
-```
+---
 
-To use CUDA, replace the runtime with the GPU build and provide CUDA 12 / cuDNN 9:
+## Building from Source & Technical Details
 
-1. Download the ONNX Runtime 1.30 CUDA 12 GPU package for Windows x64 from the [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases/tag/v1.30.0) (`onnxruntime-win-x64-gpu_cuda12-1.30.0.zip`). The CPU package has no `onnxruntime_providers_cuda.dll`.
-2. Copy `lib/onnxruntime.dll`, `lib/onnxruntime_providers_cuda.dll` and `lib/onnxruntime_providers_shared.dll` into `runtime/`, replacing the CPU DLL.
-3. Make the CUDA/cuDNN DLLs resolvable: put them in `runtime/cuda/`, set `BEESWAX_CUDA_DLLS` to semicolon-separated folders, or write one folder per line to `runtime/cuda-path.txt`. PyTorch's `lib` folder is a convenient source for the CUDA 12 / cuDNN 9 DLLs.
-4. Verify the result:
+Architecture, DSP/ONNX pipeline details, optional NVIDIA CUDA setup, CLI flags, and build instructions are documented in **[AGENTS.md](AGENTS.md)**.
 
-```powershell
-.\target\release\beeswax.exe --providers      # -> providers: CPU, CUDA
-.\target\release\beeswax.exe --self-test --cuda
-```
+---
 
-Beeswax puts those folders first on `PATH` and preloads the CUDA/cuDNN DLLs before ONNX Runtime starts. Do not copy 1.5 GB of cuDNN DLLs into the project — pointing at the folder is enough. To go back to the bundled CPU runtime, run `python scripts/vendor.py runtime --force`.
+## License & Credits
 
-Measured on the development laptop (RTX 3050 Laptop 4 GB, i7-12700H) with a game holding ~2.9 GB of VRAM:
+Beeswax is released under the [MIT License](LICENSE).
 
-| engine + model | 3 s of audio |
-|---|---|
-| CPU + int8 | 0.80 s |
-| CUDA + fp32 | 0.96 s |
-| CPU + fp32 | ~2.7 s |
-| CUDA + int8 | ~5.3 s (int8 LSTM nodes stay on the CPU) |
-
-So CUDA only pays off with the **fp32 model**; with int8 the CUDA session is slower than plain CPU.
-
-Laptop GPUs are commonly 4 GB. A game holding most of the VRAM makes the CUDA session fail to allocate; close GPU-heavy apps before starting filtration.
-
-The Intel iGPU cannot use CUDA. It would need a DirectML (or OpenVINO) build of ONNX Runtime, which Beeswax can report in `--providers` but does not expose as a backend yet.
-
-Cargo must have access to its registry for the initial build. An environment with `CARGO_NET_OFFLINE=true` needs all dependencies pre-cached; the full inference build cannot run with only the UI dependencies cached. Filtering is fully offline after installation: ONNX Runtime and the models are bundled. The app uses Windows' bundled `curl.exe` only when a models folder is missing those files, and to read the public GitHub releases page for update checks.
-
-## Use
-
-The window is organized into a live telemetry strip, three compact configuration panels, and a pinned Start/Stop footer:
-
-1. **Target Voice Profile.** Click **Record voice** and speak alone for six seconds at normal volume. Beeswax selects the loudest three-second enrollment segment, displays its waveform, and rejects silence or excessive clipping. **Play clip** auditions the saved sample through the speaker chosen under **Change speaker**; **Forget** deletes the saved profile and WAV.
-2. **Audio Routing.** Select a **Physical microphone** on the left and a **Filtered output** on the right (**CABLE Input (VB-Audio Virtual Cable)** is preselected when installed, or pick headphones to listen directly). Use **Test mic** to check the live dBFS meter before recording; **Stop test** ends the check.
-3. **Inference Engine.** Toggle between **CPU · int8** and **CUDA · GPU**. Inline banners report missing models, runtime issues, or automatic CPU fallback.
-4. Click **Start filtering**. With CABLE Input selected, choose the matching **CABLE Output** as the microphone in Discord, Teams, OBS, or another app. While filtering runs, the top telemetry strip shows the active engine, per-chunk compute time, estimated added delay, stream health, and isolated output level.
-5. **Stop** closes capture and playback.
-
-Device pickers open as keyboard-accessible overlays (Up/Down/Enter/Escape) so opening a list never shifts the layout below it.
-
-Install VB-CABLE separately from [VB-Audio](https://vb-audio.com/Cable/) if it is absent; its installer requires administrator access and may require a reboot. Beeswax does not install a driver or alter Windows default audio devices. Do not enable Windows “Listen to this device” back into the capture path.
-
-Enrollment is stored locally in `data/voice.json` and a playable `data/enrollment.wav`. Only the selected three seconds are saved. No microphone audio is uploaded. Paths are resolved from the executable’s project ancestors when the models folder is present, otherwise from the working directory; use `BEESWAX_MODELS` and `BEESWAX_DATA` for explicit locations. Recording and re-enrollment are disabled while filtering runs. An unsuccessful recording preserves the existing profile.
-
-## Microphone troubleshooting
-
-If the meter does not respond, click **Test mic** and read the status message. Windows error `0x80070005` means capture was denied. The **Windows mic privacy ↗** link opens the privacy page; check microphone access and desktop-app access. If both are already enabled, launch the executable directly from your desktop session rather than a restricted agent session. This development session received Access denied even though the consent values were Allow.
-
-## Audio pipeline
-
-Physical microphone → WASAPI/CPAL → mono → streaming polyphase sinc resampler → 16 kHz / 40 ms blocks → VoxLock via ort → weighted overlap-add → cable-rate resampling → VB-CABLE playback endpoint. Resampling uses precomputed fractional-delay coefficients to avoid recalculating trigonometric weights for every sample.
-
-The bundled graphs use `enroll_mag` and `context`, with recurrent `h/c` state `[6,32,256]`. At session startup Beeswax folds the fixed enrollment tensors (`enroll_mag` and `context`) into constant ONNX initializers and specializes the streaming chunk length (`S = 1024`) before Level-3 graph optimization, so ONNX Runtime constant-folds the 32 speaker cross-attention key/value projections once instead of recomputing them every 40 ms. VoxLock 1.1.1's reference implementation pins the ONNX files to Hugging Face revision `a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03`; those weights expose the **1.1 ONNX interface**, not the incompatible v2 graphs. The 1.1.1 release changes automatic `live()` enrollment, while Beeswax uses explicit enrollment. The implementation preserves recurrent state, reflects the initial 256 samples, uses 512-sample frames with a 128-sample hop, and applies squared-Hann overlap normalization and the upstream -0.5 output scale.
-
-Audio callbacks use bounded lock-free rings; model work runs on a worker thread. Missing samples produce silence. Capture and playback overload drop samples, trim stale capture when the model falls behind so latency stays bounded, and report the gap while keeping the session alive; repeated ONNX/device errors stop the stream, with no raw-audio bypass. Device IDs are used for opening endpoints rather than unstable enumeration positions. A stopped stream can be refreshed and restarted after device reconnection. During filtering, five consecutive 40 ms blocks below -60 dBFS RMS (200 ms of true silence) settle the recurrent and overlap-add state and then bypass the model, emitting exact silence; any speech block resumes inference immediately, so quiet calls do not burn CPU while onsets stay intact. After a pause longer than one second, the first speech block clears only the recurrent `h/c` state, leaving pending samples and overlap-add history in place so the output cadence does not move while stale silence context is dropped.
-
-CPU inference uses up to five threads by default, leaving headroom for capture, playback, and UI work. On hybrid x86 CPUs whose performance cores have SMT (Intel 12th–14th generation, for example) the process is pinned to the performance cores before ONNX Runtime starts and the pool is capped to that set: Windows otherwise migrates filter workers to efficiency cores, which measured about 20% slower per 40 ms block on a 6P+8E laptop, and the efficiency cores then stay free for games and other applications. Homogeneous machines are left alone, and `BEESWAX_THREADS` overrides the pool size. On the development laptop (i7-12700H), the specialized int8 smoke test processes three seconds of audio in about 0.8 seconds (~11.3 ms per 40 ms chunk). A busy machine can still fall behind; the stream then drops audio instead of stopping. The engine picks its model automatically: **CPU runs the int8 model**, **CUDA runs the highest precision installed** (fp32 > fp16 > int8), because the int8 LSTM nodes stay on the CPU even inside a CUDA session.
-
-Stopping and starting filtering again reuses the loaded CPU sessions instead of parsing the models a second time; only the recurrent state and overlap-add history are reset, so the second start is immediate and the audio is identical. The cache is dropped when the voice is forgotten, and CUDA sessions are never cached because an idle session would keep its GPU memory reserved.
-
-### Audio quality
-
-The shipped separator is `models/chunk_int8.onnx`: a 16 kHz model with int8-quantized LSTMs. Working at 16 kHz band-limits everything to 8 kHz, so the result cannot sound like a raw 48 kHz microphone, and int8 is the fastest, least clean precision. The stream is high-passed at 70 Hz before the model to remove the sub-bass rumble that laptop and headset microphones pick up. The Audio Routing panel reports the capture rate; a device that opens at 16 kHz or below is already band-limited before Beeswax sees it.
-
-Ways to get better sound, in order of impact:
-
-1. **Use a higher-precision model with CUDA.** Download `onnx/chunk.onnx` (fp32) from the pinned [Hugging Face revision](https://huggingface.co/arbazsiddiqui/voxlock/tree/a50f4e1d109301d4b6f61dec57ebb1a61e7d8f03/onnx) and put it in `models/`; CUDA then runs fp32 while CPU keeps using int8. fp32 alone on CPU is slower than real time, so keep this combo on the GPU.
-2. **Use the CUDA backend when the CPU is heavily loaded.** Offloading fp32 inference to the GPU leaves CPU cores free for games or encoding; fp32 on CPU or an overloaded machine can drop audio, which sounds like crackle and gaps.
-3. **Check the Stream Health metric while filtering.** Growing `gaps` or `dropped` counts mean the audio you hear is being cut, not that the model is noisy.
-4. **Listen directly through headphones** instead of a call app, which may apply its own noise suppression, AGC or compression.
-5. **Disable Windows microphone enhancements** (Sound settings → the input device → Enhancements) and use a headset microphone rather than a distant array if the input sounds distant.
-
-### Latency
-
-End-to-end delay comes from four places: the capture period (Beeswax asks WASAPI for the shortest period the driver publishes, typically 10 ms and at most the driver's minimum), the 0–40 ms wait while a 16 kHz block fills, the model's ~24 ms lookahead, and the playback path (Resampler < 2 ms, the output reserve, and the playback device period). The strongest lever is the reserve: Beeswax starts it at 60 ms — enough to cover one 40 ms block plus scheduling jitter — and adds 20 ms (up to 160 ms) only when the cable actually ran dry. The telemetry strip shows `≈N ms` under **Added Delay** while filtering, computed as capture period + 20 ms block wait + 24 ms model + reserve, so the effect of a backend change is visible.
-
-The previous build used an 83 ms pre-roll and host-default WASAPI buffers; the new one asks for the driver's minimum period and starts at 60 ms, so the added delay drops by roughly 40–50 ms. VB-CABLE and the receiving call app add their own buffering, which Beeswax cannot observe or control.
-
-There is no guarantee of completely removing other speakers. A clean enrollment and the same microphone/position improve the chance of retaining the intended voice. Independent hardware clocks can cause occasional gaps or an overflow on long sessions; adaptive clock-drift correction is not implemented.
-
-## Verification
-
-```powershell
-python scripts/vendor.py check
-cargo fmt --all -- --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
-cargo run --release -- --devices
-cargo run --release -- --test-mic
-cargo run --release -- --self-test
-cargo run --release -- --self-test --cuda   # prints the effective engine and any fallback note
-python scripts/verify-model.py
-```
-
-The Rust smoke test uses synthetic audio, exercises enrollment and streaming, and checks finite output and sample count. The Python check requires the `onnxruntime` and `numpy` packages, validates the actual local model contract, and measures inference time independently; it does not test the Rust binding. Neither measures speaker separation quality.
-
-For UI/audio development in an offline environment without the ort crates:
-
-```powershell
-cargo test --no-default-features --offline
-cargo run --no-default-features --offline
-```
-
-This explicitly disables inference. Enrollment and device controls remain available; **Start filtering reports that inference is unavailable**. It is not a functional filtering build.
-
-Hardware acceptance: enroll a real voice, record CABLE Output in a separate app while the enrolled person and a second speaker alternate and overlap, check retained-voice quality and background suppression, then exercise Stop, unplug/reconnect, re-enrollment, and a sustained call. This must be done on actual microphones and VB-CABLE; synthetic tests cannot establish it.
-
-## Sources and licensing
-
-Beeswax source code is licensed under MIT; see `LICENSE`. VoxLock's reference implementation and the bundled ONNX model files remain Apache-2.0 and are not relicensed by Beeswax. The models are redistributed from the pinned upstream revision recorded in `models.json`. GPUI Fast and other dependencies retain their own licenses; VB-CABLE is a separate VB-Audio product.
-
-- [gpui-fast](https://github.com/longbridge/gpui-fast) — native UI, Apache-2.0.
-- [ort](https://github.com/pykeio/ort) — Rust ONNX Runtime binding.
-- [ONNX Runtime](https://github.com/microsoft/onnxruntime) — inference runtime, MIT; the Windows x64 DLL is redistributed unmodified.
-- [VoxLock 1.1.1 streaming reference](https://github.com/arbazsiddiqui/voxlock/blob/v1.1.1/voxlock/core.py) and [Apache-2.0 model repository](https://huggingface.co/arbazsiddiqui/voxlock).
-- [VB-CABLE routing](https://vb-audio.com/Cable/) — separately installed virtual driver.
+Built with [gpui-fast](https://github.com/longbridge/gpui-fast) (Apache-2.0), [ort](https://github.com/pykeio/ort) & [ONNX Runtime](https://github.com/microsoft/onnxruntime) (MIT), and the [VoxLock](https://huggingface.co/arbazsiddiqui/voxlock) target-speaker separation models (Apache-2.0). [VB-CABLE](https://vb-audio.com/Cable/) is a separate product by VB-Audio.

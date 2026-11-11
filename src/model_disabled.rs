@@ -15,7 +15,11 @@ pub struct Extractor;
 impl Extractor {
     pub fn new(_: &std::path::Path, _: &[f32], _: crate::Backend) -> anyhow::Result<Self> {
         anyhow::bail!(
-            "Inference is not included in this development build. Build with default features."
+            "{}",
+            crate::i18n::tr(
+                "Inference is not included in this development build. Build with default features.",
+                "当前开发构建未包含推理功能，请使用默认特性构建。"
+            )
         )
     }
     pub fn reset_state(&mut self) -> anyhow::Result<()> {
@@ -34,9 +38,15 @@ impl Extractor {
         "none"
     }
     pub fn push(&mut self, _: &[f32]) -> anyhow::Result<Vec<f32>> {
-        anyhow::bail!("Inference unavailable")
+        anyhow::bail!(
+            "{}",
+            crate::i18n::tr("Inference unavailable", "推理功能不可用")
+        )
     }
     pub fn push_into(&mut self, _: &[f32], _: &mut Vec<f32>) -> anyhow::Result<()> {
-        anyhow::bail!("Inference unavailable")
+        anyhow::bail!(
+            "{}",
+            crate::i18n::tr("Inference unavailable", "推理功能不可用")
+        )
     }
 }

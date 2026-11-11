@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use beeswax::i18n::{Language, language, tr};
 use semver::Version;
 use std::{
     path::Path,
@@ -25,22 +26,31 @@ pub fn start(repository: Option<String>, state: Arc<Mutex<State>>) {
     let Some(repository) = repository else {
         return;
     };
-    state.lock().unwrap().message = Some("Checking for updates…".to_owned());
+    state.lock().unwrap().message = Some(tr("Checking for updates…", "正在检查更新…").to_owned());
     thread::spawn(move || {
         let result = check_latest(&repository);
         let mut current = state.lock().unwrap();
         match result {
             Ok(Some((version, url))) => {
-                current.message = Some(format!("Beeswax {version} is available"));
+                current.message = Some(match language() {
+                    Language::En => format!("Beeswax {version} is available"),
+                    Language::ZhCn => format!("发现新版本 Beeswax {version}"),
+                });
                 current.available = Some((version, url));
             }
             Ok(None) => {
-                current.message = Some(format!(
-                    "Beeswax {} is up to date",
-                    env!("CARGO_PKG_VERSION")
-                ));
+                let ver = env!("CARGO_PKG_VERSION");
+                current.message = Some(match language() {
+                    Language::En => format!("Beeswax {ver} is up to date"),
+                    Language::ZhCn => format!("当前已是最新版本 Beeswax {ver}"),
+                });
             }
-            Err(error) => current.message = Some(format!("Update check failed: {error:#}")),
+            Err(error) => {
+                current.message = Some(match language() {
+                    Language::En => format!("Update check failed: {error:#}"),
+                    Language::ZhCn => format!("检查更新失败：{error:#}"),
+                })
+            }
         }
     });
 }
@@ -50,27 +60,32 @@ pub fn start(repository: Option<String>, state: Arc<Mutex<State>>) {
 /// the unauthenticated API's hourly rate limit (which shows up as HTTP 403).
 fn check_latest(repository: &str) -> Result<Option<(String, String)>> {
     let url = format!("https://github.com/{repository}/releases/latest");
-    let output = Command::new(curl_program())
-        .args([
-            "--location",
-            "--silent",
-            "--show-error",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "20",
-            "--user-agent",
-            concat!("Beeswax/", env!("CARGO_PKG_VERSION")),
-            "--header",
-            "Accept: text/html",
-            "--output",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-            "--write-out",
-            "%{http_code}\n%{url_effective}",
-        ])
-        .arg(url)
-        .output()
-        .context("Could not start curl to check GitHub releases")?;
+    let mut cmd = Command::new(curl_program());
+    cmd.args([
+        "--location",
+        "--silent",
+        "--show-error",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "20",
+        "--user-agent",
+        concat!("Beeswax/", env!("CARGO_PKG_VERSION")),
+        "--header",
+        "Accept: text/html",
+        "--output",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+        "--write-out",
+        "%{http_code}\n%{url_effective}",
+    ])
+    .arg(url);
+    hide_console(&mut cmd);
+    let output = cmd.output().with_context(|| {
+        tr(
+            "Could not start curl to check GitHub releases",
+            "无法启动 curl 检查 GitHub 更新",
+        )
+    })?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         bail!(
@@ -150,10 +165,10 @@ fn valid_repo_char(character: char) -> bool {
 }
 
 fn remote_repository(root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["-C", root.to_str()?, "config", "--get", "remote.origin.url"])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", root.to_str()?, "config", "--get", "remote.origin.url"]);
+    hide_console(&mut cmd);
+    let output = cmd.output().ok()?;
     output
         .status
         .success()
@@ -164,6 +179,15 @@ fn remote_repository(root: &Path) -> Option<String> {
 pub fn open_release(url: &str) {
     if url.starts_with("https://github.com/") {
         let _ = Command::new("explorer.exe").arg(url).spawn();
+    }
+}
+
+fn hide_console(#[allow(unused_variables)] cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
 }
 

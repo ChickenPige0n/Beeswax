@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use beeswax::i18n::{Language, tr};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
 
@@ -12,12 +13,17 @@ pub fn load(dir: &Path) -> Result<Vec<f32>> {
     let p: Profile = serde_json::from_slice(&std::fs::read(dir.join("voice.json"))?)?;
     ensure!(
         p.version == 1 && p.sample_rate == 16000 && p.samples.len() == 48000,
-        "Unsupported enrollment profile"
+        tr("Unsupported enrollment profile", "不支持的声纹配置格式")
     );
     beeswax::dsp::enrollment(&p.samples)
 }
 pub fn save(dir: &Path, samples: &[f32]) -> Result<()> {
-    std::fs::create_dir_all(dir).context("Cannot create local voice profile directory")?;
+    std::fs::create_dir_all(dir).with_context(|| {
+        tr(
+            "Cannot create local voice profile directory",
+            "无法创建本地声纹目录",
+        )
+    })?;
     let bytes = serde_json::to_vec(&Profile {
         version: 1,
         sample_rate: 16000,
@@ -46,11 +52,33 @@ pub fn save(dir: &Path, samples: &[f32]) -> Result<()> {
     }
     Ok(())
 }
+#[derive(Default, Serialize, Deserialize)]
+struct StoredSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+}
+
+fn read_settings(dir: &Path) -> StoredSettings {
+    std::fs::read_to_string(dir.join("settings.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_settings(dir: &Path, settings: &StoredSettings) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if let Ok(bytes) = serde_json::to_vec(settings) {
+        let _ = std::fs::write(dir.join("settings.json"), bytes);
+    }
+}
+
 /// The backend chosen in the last session, if any.
 pub fn load_backend(dir: &Path) -> Option<beeswax::Backend> {
-    let text = std::fs::read_to_string(dir.join("settings.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    match value.get("backend")?.as_str()? {
+    match read_settings(dir).backend.as_deref()? {
         "cuda" => Some(beeswax::Backend::Cuda),
         "cpu" => Some(beeswax::Backend::Cpu),
         _ => None,
@@ -59,16 +87,27 @@ pub fn load_backend(dir: &Path) -> Option<beeswax::Backend> {
 
 /// Remember the backend so a GPU machine does not have to be reconfigured each launch.
 pub fn save_backend(dir: &Path, backend: beeswax::Backend) {
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let value = serde_json::json!({
-        "backend": match backend {
+    let mut settings = read_settings(dir);
+    settings.backend = Some(
+        match backend {
             beeswax::Backend::Cpu => "cpu",
             beeswax::Backend::Cuda => "cuda",
         }
-    });
-    let _ = std::fs::write(dir.join("settings.json"), value.to_string());
+        .to_owned(),
+    );
+    write_settings(dir, &settings);
+}
+
+/// The UI language chosen in the last session, if any.
+pub fn load_language(dir: &Path) -> Option<Language> {
+    Language::from_code(read_settings(dir).language.as_deref()?)
+}
+
+/// Persist the chosen UI language alongside other local settings.
+pub fn save_language(dir: &Path, language: Language) {
+    let mut settings = read_settings(dir);
+    settings.language = Some(language.code().to_owned());
+    write_settings(dir, &settings);
 }
 
 pub fn forget(dir: &Path) -> Result<()> {
@@ -106,5 +145,22 @@ mod tests {
         assert!(!dir.join("enrollment.wav").exists());
         forget(&dir).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_preserve_backend_and_language_together() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("settings-test-{}", std::process::id()));
+        save_backend(&dir, beeswax::Backend::Cuda);
+        save_language(&dir, Language::ZhCn);
+        assert_eq!(load_backend(&dir), Some(beeswax::Backend::Cuda));
+        assert_eq!(load_language(&dir), Some(Language::ZhCn));
+        save_backend(&dir, beeswax::Backend::Cpu);
+        assert_eq!(load_backend(&dir), Some(beeswax::Backend::Cpu));
+        assert_eq!(load_language(&dir), Some(Language::ZhCn));
+        let _ = std::fs::remove_file(dir.join("settings.json"));
+        let _ = std::fs::remove_dir(dir);
     }
 }
