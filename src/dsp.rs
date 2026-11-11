@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 pub const RATE: usize = 16_000;
 pub const HOP: usize = 128;
 pub const FFT: usize = 512;
@@ -9,13 +7,23 @@ const RESAMPLER_PHASES: usize = 4096;
 
 /// Streaming windowed-sinc resampling. Retains phase and filter history across callbacks.
 pub struct Resampler {
-    samples: VecDeque<f32>,
+    samples: Vec<f32>,
     position: f64,
     step: f64,
+    identity: bool,
     coefficients: Vec<f32>,
 }
 impl Resampler {
     pub fn new(input: u32, output: u32) -> Self {
+        if input == output {
+            return Self {
+                samples: Vec::new(),
+                position: 0.,
+                step: 1.,
+                identity: true,
+                coefficients: Vec::new(),
+            };
+        }
         let cutoff = (output as f64 / input as f64).min(1.) * 0.94;
         let mut coefficients = Vec::with_capacity(RESAMPLER_PHASES * RESAMPLER_TAPS);
         for phase in 0..RESAMPLER_PHASES {
@@ -36,55 +44,65 @@ impl Resampler {
             }
         }
         Self {
-            samples: VecDeque::from(vec![0.; 32]),
+            samples: vec![0.; 32],
             position: 32.,
             step: input as f64 / output as f64,
+            identity: false,
             coefficients,
         }
     }
     pub fn push(&mut self, input: &[f32]) -> Vec<f32> {
-        self.samples.extend(input.iter().copied());
-        let mut out = Vec::with_capacity((input.len() as f64 / self.step).ceil() as usize);
-        while self.position + 32. < self.samples.len() as f64 {
+        let mut out = Vec::new();
+        self.push_into(input, &mut out);
+        out
+    }
+    pub fn push_into(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        out.clear();
+        if self.identity {
+            out.extend_from_slice(input);
+            return;
+        }
+        self.samples.extend_from_slice(input);
+        let needed = (input.len() as f64 / self.step).ceil() as usize;
+        if out.capacity() < needed {
+            out.reserve(needed - out.len());
+        }
+        let samples = self.samples.as_slice();
+        while self.position + 32. < samples.len() as f64 {
             let center = self.position.floor() as isize;
             let phase = ((self.position - center as f64) * RESAMPLER_PHASES as f64) as usize;
             let weights = &self.coefficients[phase * RESAMPLER_TAPS..(phase + 1) * RESAMPLER_TAPS];
             let start = (center - 31) as usize;
-            let (front, back) = self.samples.as_slices();
-            let front_count = if start < front.len() {
-                (front.len() - start).min(RESAMPLER_TAPS)
-            } else {
-                0
-            };
-            let front_start = start.min(front.len());
-            let back_start = start.saturating_sub(front.len());
-            let mut sum = 0.;
-            for (&sample, &weight) in front[front_start..front_start + front_count]
-                .iter()
-                .zip(&weights[..front_count])
-            {
-                sum += sample * weight;
+            let window = &samples[start..start + RESAMPLER_TAPS];
+            let mut sum0 = 0f32;
+            let mut sum1 = 0f32;
+            let mut sum2 = 0f32;
+            let mut sum3 = 0f32;
+            let (s_chunks, _) = window.as_chunks::<4>();
+            let (w_chunks, _) = weights.as_chunks::<4>();
+            for (s, w) in s_chunks.iter().zip(w_chunks) {
+                sum0 += s[0] * w[0];
+                sum1 += s[1] * w[1];
+                sum2 += s[2] * w[2];
+                sum3 += s[3] * w[3];
             }
-            for (&sample, &weight) in back[back_start..back_start + RESAMPLER_TAPS - front_count]
-                .iter()
-                .zip(&weights[front_count..])
-            {
-                sum += sample * weight;
-            }
-            out.push(sum);
+            out.push((sum0 + sum1) + (sum2 + sum3));
             self.position += self.step;
         }
         let remove = (self.position.floor() as usize).saturating_sub(32);
-        self.samples.drain(..remove);
-        self.position -= remove as f64;
-        out
+        if remove > 0 {
+            let remaining = self.samples.len() - remove;
+            self.samples.copy_within(remove.., 0);
+            self.samples.truncate(remaining);
+            self.position -= remove as f64;
+        }
     }
 }
 
 pub struct OverlapAdd {
-    sum: Vec<f32>,
-    weight: Vec<f32>,
-    window: Vec<f32>,
+    sum: [f32; FFT],
+    weight: [f32; FFT],
+    window: [f32; FFT],
 }
 impl Default for OverlapAdd {
     fn default() -> Self {
@@ -93,41 +111,47 @@ impl Default for OverlapAdd {
 }
 impl OverlapAdd {
     pub fn new() -> Self {
+        let mut window = [0.; FFT];
+        for (i, slot) in window.iter_mut().enumerate() {
+            *slot = (0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT as f32).cos()).powi(2);
+        }
         Self {
-            sum: vec![0.; FFT],
-            weight: vec![0.; FFT],
-            window: (0..FFT)
-                .map(|i| {
-                    (0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT as f32).cos()).powi(2)
-                })
-                .collect(),
+            sum: [0.; FFT],
+            weight: [0.; FFT],
+            window,
         }
     }
     pub fn push(&mut self, frames: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut skip = 0;
+        self.push_into(frames, &mut skip, &mut out);
+        out
+    }
+    pub fn push_into(&mut self, frames: &[f32], skip: &mut usize, out: &mut Vec<f32>) {
         let (frames, remainder) = frames.as_chunks::<FFT>();
         assert!(remainder.is_empty());
-        let mut result = Vec::with_capacity(frames.len() * HOP);
+        out.reserve(frames.len() * HOP);
         for frame in frames {
-            for (i, &sample) in frame.iter().enumerate() {
-                self.sum[i] += sample;
-                self.weight[i] += self.window[i];
+            for ((sum, weight), (&sample, &win)) in self
+                .sum
+                .iter_mut()
+                .zip(&mut self.weight)
+                .zip(frame.iter().zip(&self.window))
+            {
+                *sum += sample;
+                *weight += win;
             }
-            for i in 0..HOP {
-                result.push(
-                    -0.5 * self.sum[i]
-                        / if self.weight[i] > 1e-11 {
-                            self.weight[i]
-                        } else {
-                            1.
-                        },
-                );
+            let drop = (*skip).min(HOP);
+            *skip -= drop;
+            for i in drop..HOP {
+                let w = self.weight[i];
+                out.push(-0.5 * self.sum[i] / if w > 1e-11 { w } else { 1. });
             }
             self.sum.copy_within(HOP.., 0);
             self.weight.copy_within(HOP.., 0);
             self.sum[FFT - HOP..].fill(0.);
             self.weight[FFT - HOP..].fill(0.);
         }
-        result
     }
 }
 
@@ -165,17 +189,18 @@ impl HighPass {
     }
 
     pub fn process(&mut self, samples: &mut [f32]) {
+        let (mut x1, mut x2, mut y1, mut y2) = (self.x1, self.x2, self.y1, self.y2);
+        let (b0, b1, b2, a1, a2) = (self.b0, self.b1, self.b2, self.a1, self.a2);
         for sample in samples.iter_mut() {
             let x = *sample;
-            let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
-                - self.a1 * self.y1
-                - self.a2 * self.y2;
-            self.x2 = self.x1;
-            self.x1 = x;
-            self.y2 = self.y1;
-            self.y1 = y;
+            let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            x2 = x1;
+            x1 = x;
+            y2 = y1;
+            y1 = y;
             *sample = y;
         }
+        (self.x1, self.x2, self.y1, self.y2) = (x1, x2, y1, y2);
     }
 }
 
@@ -276,6 +301,7 @@ pub fn enrollment(x: &[f32]) -> anyhow::Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     #[test]
     fn resampling_is_independent_of_callback_boundaries() {
         let input: Vec<_> = (0..48000).map(|i| (i as f32 * 0.07).sin()).collect();
@@ -285,6 +311,12 @@ mod tests {
         assert_eq!(whole.len(), split.len());
         assert!(whole.iter().zip(split).all(|(a, b)| (a - b).abs() < 1e-5));
         assert!((whole.len() as i32 - 16000).abs() < 32);
+    }
+    #[test]
+    fn identity_resampling_preserves_samples_without_delay() {
+        let input: Vec<_> = (0..640).map(|i| (i as f32 * 0.13).sin()).collect();
+        let mut r = Resampler::new(16000, 16000);
+        assert_eq!(r.push(&input), input);
     }
     #[test]
     fn upsampling_is_stable_across_callback_boundaries() {

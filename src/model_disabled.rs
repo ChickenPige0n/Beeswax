@@ -36,4 +36,7 @@ impl Extractor {
     pub fn push(&mut self, _: &[f32]) -> anyhow::Result<Vec<f32>> {
         anyhow::bail!("Inference unavailable")
     }
+    pub fn push_into(&mut self, _: &[f32], _: &mut Vec<f32>) -> anyhow::Result<()> {
+        anyhow::bail!("Inference unavailable")
+    }
 }

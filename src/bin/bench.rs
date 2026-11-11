@@ -201,7 +201,10 @@ struct Pipeline {
     high_pass: HighPass,
     extractor: Extractor,
     output: Resampler,
+    mono: Vec<f32>,
     pending: Vec<f32>,
+    filtered: Vec<f32>,
+    out_buf: Vec<f32>,
     gate: dsp::Gate,
     collect: bool,
     collected: Vec<f32>,
@@ -214,7 +217,10 @@ impl Pipeline {
             high_pass: HighPass::new(RATE as f32, 70.),
             extractor,
             output: Resampler::new(RATE_U32, CAPTURE_RATE),
+            mono: Vec::with_capacity(CAPTURE_BLOCK),
             pending: Vec::with_capacity(CHUNK * 2),
+            filtered: Vec::with_capacity(CHUNK),
+            out_buf: Vec::with_capacity(CHUNK * 3 + 32),
             gate: dsp::Gate::new(gate_enabled()),
             collect,
             collected: Vec::new(),
@@ -224,29 +230,34 @@ impl Pipeline {
     /// Feed one capture-rate block. Returns how many 40 ms blocks the model ran
     /// and how long those model calls took.
     fn push(&mut self, block: &[f32]) -> anyhow::Result<(usize, f64)> {
-        let mut mono = self.input.push(block);
-        self.high_pass.process(&mut mono);
-        self.pending.extend_from_slice(&mono);
+        self.input.push_into(block, &mut self.mono);
+        self.high_pass.process(&mut self.mono);
+        self.pending.extend_from_slice(&self.mono);
         let mut chunks = 0;
         let mut model_ms = 0.;
         while self.pending.len() >= CHUNK {
-            let filtered = match self.gate.next(&self.pending[..CHUNK]) {
-                dsp::GateAction::Skip => vec![0.; CHUNK],
+            match self.gate.next(&self.pending[..CHUNK]) {
+                dsp::GateAction::Skip => {
+                    self.filtered.clear();
+                    self.filtered.resize(CHUNK, 0.);
+                }
                 action => {
                     if action == dsp::GateAction::ResumeState {
                         self.extractor.reset_state()?;
                     }
                     let started = Instant::now();
-                    let filtered = self.extractor.push(&self.pending[..CHUNK])?;
+                    self.extractor
+                        .push_into(&self.pending[..CHUNK], &mut self.filtered)?;
                     model_ms += started.elapsed().as_secs_f64() * 1000.;
-                    filtered
                 }
-            };
-            if self.collect {
-                self.collected.extend_from_slice(&filtered);
             }
-            self.pending.drain(..CHUNK);
-            let _ = self.output.push(&filtered);
+            if self.collect {
+                self.collected.extend_from_slice(&self.filtered);
+            }
+            let remaining = self.pending.len() - CHUNK;
+            self.pending.copy_within(CHUNK.., 0);
+            self.pending.truncate(remaining);
+            self.output.push_into(&self.filtered, &mut self.out_buf);
             chunks += 1;
         }
         Ok((chunks, model_ms))

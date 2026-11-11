@@ -65,6 +65,8 @@ pub struct Status {
     pub monitoring: bool,
     pub previewing: bool,
     pub level: f32,
+    pub output_level: f32,
+    pub gated: bool,
     pub progress: f32,
     pub inference_ms: f32,
     /// Device sample rate of the selected microphone, in Hz.
@@ -210,6 +212,8 @@ impl Job {
             s.recording = false;
             s.monitoring = false;
             s.level = 0.;
+            s.output_level = 0.;
+            s.gated = false;
             if let Err(e) = result {
                 s.message = audio_error(&format!("{e:#}"));
             } else if flag.load(Ordering::Relaxed) {
@@ -542,7 +546,10 @@ fn run_stream(
     let mut resampler = Resampler::new(rate, RATE as u32);
     let mut high_pass = dsp::HighPass::new(RATE as f32, 70.);
     let mut gate = dsp::Gate::new(true);
-    let mut pending = Vec::new();
+    let mut pending = Vec::with_capacity(CHUNK * 2);
+    let mut mono = Vec::with_capacity(2048);
+    let mut filtered = Vec::with_capacity(CHUNK);
+    let mut output = Vec::with_capacity(output_rate as usize / 20);
     let mut captured = Vec::new();
     let mut buf = vec![0.; 4096];
     input_stream.play()?;
@@ -591,7 +598,7 @@ fn run_stream(
             continue;
         }
         last_input = Instant::now();
-        let mut mono = resampler.push(&buf[..n]);
+        resampler.push_into(&buf[..n], &mut mono);
         high_pass.process(&mut mono);
         if !mono.is_empty() {
             let mut s = state.lock().unwrap();
@@ -601,7 +608,7 @@ fn run_stream(
             continue;
         }
         if recording {
-            captured.extend(mono);
+            captured.extend_from_slice(&mono);
             state.lock().unwrap().progress = captured.len() as f32 / (6 * RATE) as f32;
             if captured.len() >= 6 * RATE {
                 let sample = dsp::enrollment(&captured)?;
@@ -609,16 +616,21 @@ fn run_stream(
                 return Ok(());
             }
         } else {
-            pending.extend(mono);
+            pending.extend_from_slice(&mono);
             while pending.len() >= CHUNK {
                 if stop.load(Ordering::Relaxed) {
                     return Ok(());
                 }
                 let start = Instant::now();
-                let filtered = match gate.next(&pending[..CHUNK]) {
+                let mut skipped = false;
+                match gate.next(&pending[..CHUNK]) {
                     // The hangover already fed silence to the model; skipping keeps the
                     // stream in time while emitting exact silence through the resampler.
-                    dsp::GateAction::Skip => vec![0.; CHUNK],
+                    dsp::GateAction::Skip => {
+                        skipped = true;
+                        filtered.clear();
+                        filtered.resize(CHUNK, 0.);
+                    }
                     action => {
                         let extractor = model.as_mut().unwrap();
                         if action == dsp::GateAction::ResumeState
@@ -628,30 +640,32 @@ fn run_stream(
                                 "Could not clear the stale voice state; continuing: {error:#}"
                             );
                         }
-                        match extractor.push(&pending[..CHUNK]) {
-                            Ok(filtered) => {
-                                failures = 0;
-                                filtered
-                            }
+                        if let Err(error) = extractor.push_into(&pending[..CHUNK], &mut filtered) {
                             // A single bad block should not end the call: drop it, keep the stream
                             // alive, and only stop when the model keeps failing.
-                            Err(error) => {
-                                failures += 1;
-                                if failures >= 3 {
-                                    return Err(
-                                        error.context("The voice model stopped returning audio")
-                                    );
-                                }
-                                state.lock().unwrap().message =
-                                    format!("Voice model hiccup; recovering: {error:#}");
-                                vec![0.; CHUNK]
+                            failures += 1;
+                            if failures >= 3 {
+                                return Err(
+                                    error.context("The voice model stopped returning audio")
+                                );
                             }
+                            state.lock().unwrap().message =
+                                format!("Voice model hiccup; recovering: {error:#}");
+                            filtered.clear();
+                            filtered.resize(CHUNK, 0.);
+                        } else {
+                            failures = 0;
                         }
                     }
-                };
-                pending.drain(..CHUNK);
+                }
+                let remaining = pending.len() - CHUNK;
+                pending.copy_within(CHUNK.., 0);
+                pending.truncate(remaining);
                 let duration = start.elapsed().as_secs_f32() * 1000.;
-                let output = output_resampler.as_mut().unwrap().push(&filtered);
+                output_resampler
+                    .as_mut()
+                    .unwrap()
+                    .push_into(&filtered, &mut output);
                 let producer = output_producer.as_mut().unwrap();
                 let pushed = producer.push_slice(&output);
                 let short = pushed < output.len();
@@ -670,8 +684,13 @@ fn run_stream(
                         }
                     }
                 }
+                let out_rms = if skipped { 0. } else { dsp::rms(&filtered) };
                 let mut s = state.lock().unwrap();
-                s.inference_ms = duration;
+                if !skipped {
+                    s.inference_ms = duration;
+                }
+                s.gated = skipped;
+                s.output_level = out_rms.max(s.output_level * 0.88);
                 s.buffer_ms = reserve_ms as f32 + output_device_ms;
                 s.underruns = misses_now;
                 s.dropped = dropped + overruns.load(Ordering::Relaxed);
